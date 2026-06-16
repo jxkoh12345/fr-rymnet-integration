@@ -1,0 +1,7 @@
+.env
+state/
+*.log
+__pycache__/
+*.pyc
+.venv/
+generate.py
