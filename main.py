@@ -1,6 +1,7 @@
 import argparse
 import logging
 import json
+import os
 import time
 from datetime import datetime, timedelta
 from signature.door_events import iter_pages
@@ -30,6 +31,7 @@ MASK_STATUS   = -1
 SORT_FIELD    = 'SwipeTime'
 ORDER_TYPE    = 1
 BATCH_SIZE    = 100
+EVENT_TEST    = os.environ.get('EVENT_TEST', '')
 SEND_RETRIES  = 3
 SEND_RETRY_DELAY = 2   # seconds between send retries
 WINDOW_MINUTES   = 30  # fetch window size
@@ -150,6 +152,9 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
             start_page=resume_page,
         ):
             bodies = [_resolve_record(e, person_cache) for e in events]
+            for record in bodies:
+                if EVENT_TEST and record.get('employee_no') == EVENT_TEST:
+                    notify(f"[HIK SYNC] Event found:\n{json.dumps(record, indent=2)}")
             if batch and len(batch) + len(bodies) > BATCH_SIZE:
                 if not flush():
                     return False, 0
