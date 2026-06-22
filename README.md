@@ -86,6 +86,7 @@ hik/
 ├── checkpoint.py           # disk-backed per-window state + failed-window queue
 ├── notifier.py             # Lark (Feishu) notifications
 ├── DoorList.py             # door metadata (id → type/name/indicator)
+├── find_username.py        # CLI: query raw Hikvision events by time range / employee
 ├── signature/
 │   ├── auth.py             # Hikvision HMAC request signing
 │   ├── door_events.py      # door-event fetch (paged / resumable)
@@ -95,6 +96,7 @@ hik/
 ├── test_checkpoint.py      # checkpoint + retry tests (no network)
 ├── test_lark.py            # live Lark smoke test
 ├── .env                    # secrets / endpoints (gitignored)
+├── find_results.log        # output of find_username.py (overwritten each run, gitignored)
 └── state/                  # runtime checkpoints (gitignored, auto-created)
 ```
 
@@ -233,6 +235,24 @@ Start the continuous scheduler:
 uv run python main.py            # resume from any saved state
 uv run python main.py --reset    # wipe state, then run
 ```
+
+**Query raw Hikvision events (`find_username.py`):**
+
+```bash
+# all events in a time range → find_results.log
+uv run python find_username.py -t 2026-06-22T08:00:00 2026-06-22T09:00:00
+
+# filter by employee name or ID (partial, case-insensitive)
+uv run python find_username.py -t 2026-06-22T08:00:00 2026-06-22T09:00:00 -u john
+uv run python find_username.py -t 2026-06-22T08:00:00 2026-06-22T09:00:00 -u E001
+```
+
+Each run **overwrites** `find_results.log` with the full JSON output. The terminal
+prints a one-line summary (`47 record(s) → find_results.log` or `No data found`).
+Each event includes a `_resolved` field with the `personCode` and `personName`
+looked up from the Hikvision person API (cached per run).
+
+Timezone (`+08:00`) is appended automatically if omitted from the timestamps.
 
 Smoke-test Lark:
 

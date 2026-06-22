@@ -115,9 +115,11 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
     resume_page = checkpoint.load_checkpoint(signature) + 1
 
     person_cache: dict = {}
+    seen: set         = set()
     batch: list       = []
     batch_pages: list = []
     total             = 0
+    dupes             = 0
 
     def flush() -> bool:
         nonlocal batch, batch_pages, total
@@ -152,13 +154,21 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
             start_page=resume_page,
         ):
             bodies = [_resolve_record(e, person_cache) for e in events]
+            deduped = []
             for record in bodies:
                 if EVENT_TEST and record.get('employee_no') == EVENT_TEST:
                     notify(f"[HIK SYNC] Event found:\n{json.dumps(record, indent=2)}")
-            if batch and len(batch) + len(bodies) > BATCH_SIZE:
+                key = (record.get('employee_no', ''), record.get('logtime', ''))
+                if key in seen:
+                    dupes += 1
+                    logger.debug(f"Duplicate skipped: employee_no={key[0]} logtime={key[1]}")
+                    continue
+                seen.add(key)
+                deduped.append(record)
+            if batch and len(batch) + len(deduped) > BATCH_SIZE:
                 if not flush():
                     return False, 0
-            batch.extend(bodies)
+            batch.extend(deduped)
             batch_pages.append(page_no)
             if len(batch) >= BATCH_SIZE:
                 if not flush():
@@ -173,7 +183,7 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
 
     checkpoint.clear_window(signature)  # completed — no longer needs to rerun
     elapsed = time.perf_counter() - cycle_start
-    logger.info(f"=== Window done — {total} records sent in {elapsed:.2f}s ===")
+    logger.info(f"=== Window done — {total} records sent, {dupes} duplicates skipped in {elapsed:.2f}s ===")
     return True, total
 
 
