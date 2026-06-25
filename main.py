@@ -36,6 +36,7 @@ SEND_RETRIES  = 3
 SEND_RETRY_DELAY = 2   # seconds between send retries
 WINDOW_MINUTES   = 30  # fetch window size
 MAX_WINDOW_RETRIES = 10  # retries (one per scheduler tick) before giving up on a failed window
+MIN_GAP_MINUTES  = 5   # suppress duplicate events for the same person within this window
 
 
 def _fmt(dt: datetime) -> str:
@@ -115,7 +116,8 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
     resume_page = checkpoint.load_checkpoint(signature) + 1
 
     person_cache: dict = {}
-    seen: set         = set()
+    seen: set         = set()   # exact dedup fallback for empty employee_no
+    last_sent: dict   = {}      # employee_no → last sent datetime
     batch: list       = []
     batch_pages: list = []
     total             = 0
@@ -158,12 +160,25 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
             for record in bodies:
                 if EVENT_TEST and record.get('employee_no') == EVENT_TEST:
                     notify(f"[HIK SYNC] Event found:\n{json.dumps(record, indent=2)}")
-                key = (record.get('employee_no', ''), record.get('logtime', ''))
-                if key in seen:
-                    dupes += 1
-                    logger.debug(f"Duplicate skipped: employee_no={key[0]} logtime={key[1]}")
-                    continue
-                seen.add(key)
+                emp = record.get('employee_no', '')
+                logtime_str = record.get('logtime', '')
+                if emp:
+                    try:
+                        t = datetime.strptime(logtime_str, '%Y-%m-%d %H:%M:%S')
+                        if emp in last_sent and abs((t - last_sent[emp]).total_seconds()) < MIN_GAP_MINUTES * 60:
+                            dupes += 1
+                            logger.debug(f"Duplicate skipped (<{MIN_GAP_MINUTES}min gap): employee_no={emp} logtime={logtime_str}")
+                            continue
+                        last_sent[emp] = t
+                    except ValueError:
+                        pass
+                else:
+                    key = (emp, logtime_str)
+                    if key in seen:
+                        dupes += 1
+                        logger.debug(f"Duplicate skipped: employee_no={emp} logtime={logtime_str}")
+                        continue
+                    seen.add(key)
                 deduped.append(record)
             if batch and len(batch) + len(deduped) > BATCH_SIZE:
                 if not flush():
@@ -225,6 +240,29 @@ def _retry_failed_windows() -> int:
     return sent
 
 
+def recover_windows() -> int:
+    """Re-run orphan windows (a file in state/windows/ but NOT queued in failed.json),
+    resuming from each checkpoint. run_window clears the file on success; failures stay.
+    Returns records recovered."""
+    queued = {(it['start'], it['end']) for it in checkpoint.load_failed()}
+    orphans = [q for q in checkpoint.load_all_windows()
+               if (q['start'], q['end']) not in queued]
+    if not orphans:
+        logger.info("No orphan windows to recover")
+        return 0
+    logger.info(f"Recovering {len(orphans)} orphan window(s)")
+    sent = 0
+    for q in orphans:
+        ok, n = run_window(q['start'], q['end'])
+        if ok:
+            sent += n
+            logger.info(f"Recovered window {q['start']} → {q['end']}")
+        else:
+            logger.error(f"Still failing {q['start']} → {q['end']} — left in place")
+    logger.info(f"Recovery done — {sent} records sent")
+    return sent
+
+
 def scheduler(reset: bool = False):
     logger.info("Scheduler started — running every 30 minutes, continuous.")
     if reset:
@@ -257,11 +295,24 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Hik → Rymnet attendance sync (continuous, resumable)")
     parser.add_argument('--reset', action='store_true',
                         help="Clear saved checkpoint/pending before starting")
+    parser.add_argument('--clear-windows', action='store_true',
+                        help="Delete all files in state/windows/ and exit")
+    parser.add_argument('--recover-windows', action='store_true',
+                        help="Re-run orphan windows in state/windows/ (resume from checkpoint), then exit")
     parser.add_argument('--start', metavar='DATETIME',
                         help="Test mode: window start, e.g. 2026-04-01T08:00:00")
     parser.add_argument('--end', metavar='DATETIME',
                         help="Test mode: window end,   e.g. 2026-04-01T08:30:00")
     args = parser.parse_args()
+
+    if args.clear_windows:
+        checkpoint.clear_windows()
+        logger.info("Cleared state/windows/")
+        raise SystemExit(0)
+
+    if args.recover_windows:
+        recover_windows()
+        raise SystemExit(0)
 
     if args.start or args.end:
         if not (args.start and args.end):

@@ -91,6 +91,26 @@ def clear_window(signature: dict):
         pass
 
 
+def load_all_windows() -> list:
+    """Return the stored query signature of every window file in state/windows/."""
+    try:
+        names = os.listdir(_windows_dir())
+    except FileNotFoundError:
+        return []
+    out = []
+    for name in names:
+        if not name.endswith('.json'):
+            continue
+        try:
+            with open(os.path.join(_windows_dir(), name), encoding='utf-8') as f:
+                q = json.load(f).get('query')
+        except (json.JSONDecodeError, OSError):
+            continue
+        if q:
+            out.append(q)
+    return out
+
+
 # --- failed-window queue ---
 
 def load_failed() -> list:
@@ -113,6 +133,14 @@ def add_failed(start: str, end: str):
         return
     items.append({'start': start, 'end': end, 'attempts': 0})
     save_failed(items)
+
+
+def clear_windows():
+    """Delete all per-window state files in state/windows/."""
+    try:
+        shutil.rmtree(_windows_dir())
+    except FileNotFoundError:
+        pass
 
 
 def reset():
