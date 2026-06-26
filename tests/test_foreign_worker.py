@@ -58,7 +58,31 @@ def test_on_non_fw_filtered():
 def test_on_mixed_only_fw_sent():
     sent = _run([r('RC3645'), r('FWA00304480'), r('FWB00100001')], foreign_worker=True)
     assert len(sent) == 2
-    assert all(s['employee_no'].startswith('FW') for s in sent)
+    assert all(s['employee_no'].startswith('FW-') for s in sent)
+
+
+# --- dash insertion ---
+
+def test_on_dash_inserted():
+    sent = _run([r('FWBT0490848')], foreign_worker=True)
+    assert sent[0]['employee_no'] == 'FW-BT0490848'
+
+
+def test_on_dash_not_inserted_when_off():
+    sent = _run([r('FWBT0490848')], foreign_worker=False)
+    assert sent[0]['employee_no'] == 'FWBT0490848'
+
+
+def test_on_dash_inserted_multiple():
+    sent = _run([r('FWA00304480'), r('FWBT0490848')], foreign_worker=True)
+    assert sent[0]['employee_no'] == 'FW-A00304480'
+    assert sent[1]['employee_no'] == 'FW-BT0490848'
+
+
+def test_on_fw_only_becomes_fw_dash():
+    # "FW" with nothing after → "FW-"
+    sent = _run([r('FW')], foreign_worker=True)
+    assert sent[0]['employee_no'] == 'FW-'
 
 
 def test_on_empty_employee_no_filtered():

@@ -183,6 +183,8 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
                 deduped.append(record)
             if FOREIGN_WORKER:
                 deduped = [rec for rec in deduped if rec.get('employee_no', '').startswith('FW')]
+                for rec in deduped:
+                    rec['employee_no'] = 'FW-' + rec['employee_no'][2:]
             if batch and len(batch) + len(deduped) > BATCH_SIZE:
                 if not flush():
                     return False, 0
