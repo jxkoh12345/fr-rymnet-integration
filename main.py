@@ -37,6 +37,7 @@ SEND_RETRY_DELAY = 2   # seconds between send retries
 WINDOW_MINUTES   = 30  # fetch window size
 MAX_WINDOW_RETRIES = 10  # retries (one per scheduler tick) before giving up on a failed window
 MIN_GAP_MINUTES  = 5   # suppress duplicate events for the same person within this window
+FOREIGN_WORKER   = os.environ.get('FOREIGN_WORKER', '').lower() == 'true'
 
 
 def _fmt(dt: datetime) -> str:
@@ -180,6 +181,8 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
                         continue
                     seen.add(key)
                 deduped.append(record)
+            if FOREIGN_WORKER:
+                deduped = [rec for rec in deduped if rec.get('employee_no', '').startswith('FW')]
             if batch and len(batch) + len(deduped) > BATCH_SIZE:
                 if not flush():
                     return False, 0
