@@ -68,9 +68,9 @@ def test_on_dash_inserted():
     assert sent[0]['employee_no'] == 'FW-BT0490848'
 
 
-def test_on_dash_not_inserted_when_off():
+def test_dash_inserted_even_when_off():
     sent = _run([r('FWBT0490848')], foreign_worker=False)
-    assert sent[0]['employee_no'] == 'FWBT0490848'
+    assert sent[0]['employee_no'] == 'FW-BT0490848'
 
 
 def test_on_dash_inserted_multiple():
