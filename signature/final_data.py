@@ -24,5 +24,8 @@ def send(records: list) -> dict:
         'Authorization': f'Bearer {BEARER_TOKEN}',
     }
     res = requests.post(URL, headers=headers, data=json.dumps(records))
-    res.raise_for_status()
+    try:
+        res.raise_for_status()
+    except requests.HTTPError as e:
+        raise requests.HTTPError(f"{e} — response body: {res.text[:500]}", response=res) from None
     return res.json()

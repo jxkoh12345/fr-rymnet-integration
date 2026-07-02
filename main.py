@@ -12,10 +12,14 @@ import checkpoint
 from notifier import notify
 
 # --- Logger setup ---
+os.makedirs('errors', exist_ok=True)
+error_handler = logging.FileHandler('errors/errors.log', encoding='utf-8')
+error_handler.setLevel(logging.ERROR)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[logging.StreamHandler()],
+    handlers=[logging.StreamHandler(), error_handler],
 )
 logger = logging.getLogger(__name__)
 
