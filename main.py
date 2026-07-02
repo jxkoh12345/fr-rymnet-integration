@@ -74,6 +74,50 @@ def _send_with_retry(records: list, label: str) -> tuple[bool, float]:
     return False, time.perf_counter() - t0
 
 
+def _log_rejected(records: list, window: str):
+    """Append records Rymnet rejected individually to errors/rejected.jsonl."""
+    os.makedirs('errors', exist_ok=True)
+    with open('errors/rejected.jsonl', 'a', encoding='utf-8') as f:
+        for r in records:
+            f.write(json.dumps({'window': window, 'record': r}, ensure_ascii=False) + '\n')
+    logger.error(f"{len(records)} record(s) rejected by Rymnet — logged to errors/rejected.jsonl")
+
+
+def _send_resilient(records: list, pages: list, signature: dict, window: str) -> tuple[bool, int]:
+    """Send a batch; if it fails, isolate per-record so one poison record can't
+    block the rest. Returns (should_stop, num_sent).
+
+      batch OK                     -> (False, len(records))
+      fails, none send alone       -> outage: pending saved, (True, 0)
+      fails, some send alone       -> log+drop the rest, advance page, (False, num_good)
+    """
+    label = f"pages {pages} ({len(records)} records)"
+    ok, _ = _send_with_retry(records, f"Batch {label}")
+    if ok:
+        checkpoint.save_page(signature, max(pages))
+        return False, len(records)
+
+    logger.warning(f"Batch {label} failed — isolating per-record")
+    good, bad = [], []
+    for rec in records:
+        try:
+            send([rec])
+            good.append(rec)
+        except Exception:
+            bad.append(rec)
+
+    if not good:
+        checkpoint.save_pending(signature, pages, records)
+        logger.error(f"Batch {label}: no records accepted individually — saved as pending, stopping.")
+        notify(f"[HIK SYNC] Rymnet rejecting whole batch — saved pending, will retry.\nWindow: {window}\n{label}")
+        return True, 0
+
+    if bad:
+        _log_rejected(bad, window)
+    checkpoint.save_page(signature, max(pages))
+    return False, len(good)
+
+
 def _resolve_record(item: dict, person_cache: dict) -> dict:
     pid = item['personId']
     if pid not in person_cache:
@@ -106,16 +150,11 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
     # 1. Rymnet retry: re-send the batch that failed last run.
     pending = checkpoint.load_pending(signature)
     if pending:
-        label = f"Pending batch (pages {pending['pages']}, {len(pending['records'])} records)"
-        logger.info(f"Retrying {label}")
-        ok, elapsed = _send_with_retry(pending['records'], label)
-        if ok:
-            checkpoint.save_page(signature, max(pending['pages']))
-            checkpoint.clear_pending(signature)
-        else:
-            logger.error("Pending batch still failing — stopping.")
-            notify(f"[HIK SYNC] Pending batch still failing.\nWindow: {start} → {end}")
+        logger.info(f"Retrying pending batch (pages {pending['pages']}, {len(pending['records'])} records)")
+        stop, _ = _send_resilient(pending['records'], pending['pages'], signature, f"{start} → {end}")
+        if stop:
             return False, 0
+        checkpoint.clear_pending(signature)
 
     # 2. Hik resume: continue from last fully-sent page.
     resume_page = checkpoint.load_checkpoint(signature) + 1
@@ -132,18 +171,13 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
         nonlocal batch, batch_pages, total
         if not batch:
             return True
-        label = f"Batch pages {batch_pages} ({len(batch)} records)"
-        ok, elapsed = _send_with_retry(batch, label)
-        if ok:
-            checkpoint.save_page(signature, max(batch_pages))
-            total += len(batch)
-            batch.clear()
-            batch_pages.clear()
-            return True
-        checkpoint.save_pending(signature, batch_pages, batch)
-        logger.error(f"{label} failed after {SEND_RETRIES} retries — saved as pending, stopping.")
-        notify(f"[HIK SYNC] Rymnet send failed after {SEND_RETRIES} retries — batch saved, will retry.\nWindow: {start} → {end}\n{label}")
-        return False
+        stop, sent = _send_resilient(batch, batch_pages, signature, f"{start} → {end}")
+        if stop:
+            return False
+        total += sent
+        batch.clear()
+        batch_pages.clear()
+        return True
 
     try:
         for page_no, events in iter_pages(
