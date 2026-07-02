@@ -61,11 +61,13 @@ def _send_with_retry(records: list, label: str) -> tuple[bool, float]:
     """Send a batch, retrying up to SEND_RETRIES times.
     Returns (success, elapsed_seconds)."""
     t0 = time.perf_counter()
+    times = [r['logtime'] for r in records if r.get('logtime')]
+    span = f"{min(times)} → {max(times)}" if times else "—"
     for attempt in range(1, SEND_RETRIES + 1):
         try:
             result = send(records)
             elapsed = time.perf_counter() - t0
-            logger.info(f"{label} OK in {elapsed:.2f}s: {json.dumps(result)}")
+            logger.info(f"{label} [{span}] OK in {elapsed:.2f}s: {json.dumps(result)}")
             return True, elapsed
         except Exception as e:
             logger.error(f"{label} attempt {attempt}/{SEND_RETRIES} FAILED: {e}")
