@@ -91,31 +91,40 @@ def iter_pages(
     order_type: int,
     start_page: int = 1,
 ):
-    """Yields (page_no, events_list) per page, starting at start_page.
+    """Yields (global_page_no, events_list) per page, starting at start_page.
 
-    Resumable paging for a SINGLE door chunk (<=10 doors, prod has 4). Page
-    numbering is only unambiguous within one chunk, so >10 doors is rejected.
+    The API caps doorIndexCodes at 10, so doors are split into chunks of 10.
+    Each chunk's pages are laid end-to-end on a single global page counter
+    (chunk 0 -> 1..P0, chunk 1 -> P0+1..P0+P1, ...) so page numbers stay
+    unambiguous and resumable across chunks. Boundaries are recomputed from
+    each chunk's page-1 total, so reruns must see stable window data (they do:
+    windows are closed past slots).
     """
-    if len(door_index_codes) > 10:
-        raise ValueError("iter_pages supports <=10 doors (single chunk) for resumable paging")
-
     base_params = _build_base_params(
         start_time, end_time, event_type, person_name, person_id, person_code,
         temperature_status, mask_status, sort_field, order_type,
     )
-    params = {**base_params, 'doorIndexCodes': [str(c) for c in door_index_codes]}
+    chunks = [door_index_codes[i:i + 10] for i in range(0, len(door_index_codes), 10)]
 
-    first = _fetch_page(params, start_page)
-    if str(first.get('code')) != '0':
-        raise RuntimeError(f"door_events error: {first.get('msg')}")
-    total_pages = math.ceil(first['data']['total'] / PAGE_SIZE)
-    if start_page <= total_pages:
-        yield start_page, first['data']['list']
-    for page in range(start_page + 1, total_pages + 1):
-        res = _fetch_page(params, page)
-        if str(res.get('code')) != '0':
-            raise RuntimeError(f"door_events error: {res.get('msg')}")
-        yield page, res['data']['list']
+    global_page = 0
+    for chunk in chunks:
+        params = {**base_params, 'doorIndexCodes': [str(c) for c in chunk]}
+        first = _fetch_page(params, 1)
+        if str(first.get('code')) != '0':
+            raise RuntimeError(f"door_events error: {first.get('msg')}")
+        total_pages = math.ceil(first['data']['total'] / PAGE_SIZE)
+        for local in range(1, total_pages + 1):
+            g = global_page + local
+            if g < start_page:
+                continue
+            if local == 1:
+                yield g, first['data']['list']
+            else:
+                res = _fetch_page(params, local)
+                if str(res.get('code')) != '0':
+                    raise RuntimeError(f"door_events error: {res.get('msg')}")
+                yield g, res['data']['list']
+        global_page += total_pages
 
 
 def fetch_all_events(
