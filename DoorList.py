@@ -5,8 +5,8 @@ DoorList = {
     # 1553: {"type": "Controller", "doorName": "C. LOBBY PARKING STAIRCASE", "indicator": None},
     # 1592: {"type": "Controller", "doorName": "C. OUTBOUND LOADING BAY OUT 1", "indicator": None},
     # 4733: {"type": "Controller", "doorName": "CJ CONTROLLER DOOR_Door_1", "indicator": None},
-    # 4729: {"type": "Door", "doorName": "CJ FR ENTRY_Door_1", "indicator": "IN"},
-    # 4741: {"type": "Door", "doorName": "CJ FR EXIT_Door_1", "indicator": "OUT"},
+    4729: {"type": "Door", "doorName": "CJ FR ENTRY_Door_1", "indicator": "IN"},
+    4741: {"type": "Door", "doorName": "CJ FR EXIT_Door_1", "indicator": "OUT"},
     # 1476: {"type": "Controller", "doorName": "CONTROLLER BIN AREA", "indicator": None}, #Controller
     # 1517: {"type": "Controller", "doorName": "CONTROLLER FR - OUTBOUND 3", "indicator": None}, #Controller
     # 3626: {"type": "Controller", "doorName": "CONTROLLER FR CONTROL ROOM", "indicator": None}, #Controller
