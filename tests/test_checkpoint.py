@@ -3,6 +3,8 @@ fetch_person_info are stubbed. State dir is redirected to a temp folder.
 
 Run:  python -m unittest test_checkpoint -v
 """
+import glob
+import json
 import os
 import tempfile
 import unittest
@@ -50,6 +52,22 @@ class FakeSend:
         return {'ok': True}
 
 
+class FakeSelectiveSend:
+    """Whole batches (>1 record) always fail. Single-record sends fail only
+    for employee_no in `bad`."""
+    def __init__(self, bad):
+        self.bad = set(bad)
+        self.calls = []
+
+    def __call__(self, records):
+        self.calls.append(list(records))
+        if len(records) > 1:
+            raise RuntimeError("batch rejected")
+        if records[0].get('employee_no') in self.bad:
+            raise RuntimeError(f"rejected {records[0]['employee_no']}")
+        return {'ok': True}
+
+
 class StateTestBase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -59,8 +77,10 @@ class StateTestBase(unittest.TestCase):
         self._orig_person = main.fetch_person_info
         self._orig_delay  = main.SEND_RETRY_DELAY
         self._orig_maxret = main.MAX_WINDOW_RETRIES
+        self._orig_notify = main.notify
         main.fetch_person_info = lambda pid: {'personCode': f'E_{pid}'}
         main.SEND_RETRY_DELAY = 0
+        main.notify = lambda *a, **k: None   # never hit real Lark in tests
         self.sig = checkpoint.query_signature(START, END, main.DOORS, main.EVENT_TYPE)
 
     def tearDown(self):
@@ -69,6 +89,7 @@ class StateTestBase(unittest.TestCase):
         main.fetch_person_info = self._orig_person
         main.SEND_RETRY_DELAY  = self._orig_delay
         main.MAX_WINDOW_RETRIES = self._orig_maxret
+        main.notify        = self._orig_notify
         self._tmp.cleanup()
 
     def run_window(self, reset=False):
@@ -147,7 +168,9 @@ class MainFlowTests(StateTestBase):
 
         self.assertFalse(ok)             # regression guard: not None
         self.assertEqual(n, 0)
-        self.assertEqual(len(fake.calls), 1 + main.SEND_RETRIES)
+        # batch 1 sends once; batch 2 = SEND_RETRIES whole-batch attempts
+        # + 100 per-record isolation sends (all fail -> saved pending)
+        self.assertEqual(len(fake.calls), 1 + main.SEND_RETRIES + 100)
         self.assertEqual(checkpoint.load_checkpoint(self.sig), 2)
         pending = checkpoint.load_pending(self.sig)
         self.assertEqual(pending['pages'], [3, 4])
@@ -181,7 +204,9 @@ class MainFlowTests(StateTestBase):
         ok, n = self.run_window()
 
         self.assertFalse(ok)
-        self.assertEqual(len(fake.calls), main.SEND_RETRIES)  # only pending retried
+        # pending retried whole-batch (SEND_RETRIES) + 100 per-record isolation sends;
+        # all fail -> stops before any fetch
+        self.assertEqual(len(fake.calls), main.SEND_RETRIES + 100)
         self.assertIsNone(iterp.start_page)                   # never fetched
         self.assertIsNotNone(checkpoint.load_pending(self.sig))
         self.assertEqual(checkpoint.load_checkpoint(self.sig), 2)
@@ -249,6 +274,86 @@ class WindowRetryTests(StateTestBase):
 
     def test_retry_noop_when_empty(self):
         self.assertEqual(main._retry_failed_windows(), 0)
+
+
+class PerRecordIsolationTests(StateTestBase):
+    def test_bad_records_filtered_out_and_good_ones_counted(self):
+        # 2 pages x 50 = 100 events -> 1 batch of 100, batch send fails
+        main.iter_pages = FakeIterPages(total_pages=2)
+        bad = {'E_p1_5', 'E_p2_10'}
+        fake = FakeSelectiveSend(bad)
+        main.send = fake
+        notes: list = []
+        main.notify = lambda msg: notes.append(msg)
+
+        orig_cwd = os.getcwd()
+        os.chdir(self._tmp.name)
+        try:
+            ok, n = self.run_window()
+            rejected_files = glob.glob(os.path.join('errors', 'rejected_*.json'))
+            logged = []
+            if rejected_files:
+                with open(rejected_files[0], encoding='utf-8') as f:
+                    logged = json.load(f)
+        finally:
+            os.chdir(orig_cwd)
+
+        self.assertTrue(ok)                       # window still completes
+        self.assertEqual(n, 100 - len(bad))        # bad ones excluded from sent count
+        self.assertEqual(checkpoint.load_checkpoint(self.sig), 0)  # cleared — window fully done
+        self.assertIsNone(checkpoint.load_pending(self.sig))
+
+        # isolation actually happened: SEND_RETRIES whole-batch attempts, then
+        # every record retried on its own (one send per record).
+        batch_calls  = [c for c in fake.calls if len(c) > 1]
+        single_calls = [c for c in fake.calls if len(c) == 1]
+        self.assertEqual(len(batch_calls), main.SEND_RETRIES)
+        self.assertTrue(all(len(c) == 100 for c in batch_calls))
+        self.assertEqual(len(single_calls), 100)
+
+        # the good records were delivered individually; the bad ones were attempted too
+        attempted = {c[0]['employee_no'] for c in single_calls}
+        self.assertEqual(attempted, {f'E_p{p}_{i}' for p in (1, 2) for i in range(50)})
+
+        # bad records recorded individually, full content + window tag preserved
+        self.assertEqual(len(rejected_files), 1)
+        self.assertEqual(len(logged), len(bad))
+        self.assertEqual({r['record']['employee_no'] for r in logged}, bad)
+        for entry in logged:
+            self.assertEqual(entry['window'], f"{START} → {END}")
+            self.assertEqual(
+                set(entry['record']),
+                {'employee_no', 'logtime', 'indicator', 'location', 'remarks'},
+            )
+
+        # a single notification fired, naming the rejected file + the resend command
+        self.assertEqual(len(notes), 1)
+        self.assertIn(rejected_files[0], notes[0])
+        self.assertIn('debug_pending.py --send', notes[0])
+
+    def test_all_records_bad_saved_pending_not_logged(self):
+        main.iter_pages = FakeIterPages(total_pages=2)
+        fake = FakeSelectiveSend(bad={f'E_p1_{i}' for i in range(50)} | {f'E_p2_{i}' for i in range(50)})
+        main.send = fake
+        notes: list = []
+        main.notify = lambda msg: notes.append(msg)
+
+        orig_cwd = os.getcwd()
+        os.chdir(self._tmp.name)
+        try:
+            ok, n = self.run_window()
+            rejected_files = glob.glob(os.path.join('errors', 'rejected_*.json'))
+        finally:
+            os.chdir(orig_cwd)
+
+        self.assertFalse(ok)
+        self.assertEqual(n, 0)
+        self.assertEqual(rejected_files, [])       # nothing logged — saved as pending instead
+        self.assertIsNotNone(checkpoint.load_pending(self.sig))
+
+        # notified about the whole-batch rejection, with the isolate command
+        self.assertEqual(len(notes), 1)
+        self.assertIn('debug_pending.py --send', notes[0])
 
 
 if __name__ == '__main__':

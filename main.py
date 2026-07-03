@@ -76,13 +76,15 @@ def _send_with_retry(records: list, label: str) -> tuple[bool, float]:
     return False, time.perf_counter() - t0
 
 
-def _log_rejected(records: list, window: str):
-    """Append records Rymnet rejected individually to errors/rejected.jsonl."""
+def _log_rejected(records: list, window: str) -> str:
+    """Save records Rymnet rejected individually to errors/rejected_<timestamp>.json.
+    Returns the file path."""
     os.makedirs('errors', exist_ok=True)
-    with open('errors/rejected.jsonl', 'a', encoding='utf-8') as f:
-        for r in records:
-            f.write(json.dumps({'window': window, 'record': r}, ensure_ascii=False) + '\n')
-    logger.error(f"{len(records)} record(s) rejected by Rymnet — logged to errors/rejected.jsonl")
+    path = os.path.join('errors', f"rejected_{datetime.now():%Y%m%d_%H%M%S}.json")
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump([{'window': window, 'record': r} for r in records], f, ensure_ascii=False, indent=2)
+    logger.error(f"{len(records)} record(s) rejected by Rymnet — logged to {path}")
+    return path
 
 
 def _send_resilient(records: list, pages: list, signature: dict, window: str) -> tuple[bool, int]:
@@ -111,11 +113,20 @@ def _send_resilient(records: list, pages: list, signature: dict, window: str) ->
     if not good:
         checkpoint.save_pending(signature, pages, records)
         logger.error(f"Batch {label}: no records accepted individually — saved as pending, stopping.")
-        notify(f"[HIK SYNC] Rymnet rejecting whole batch — saved pending, will retry.\nWindow: {window}\n{label}")
+        notify(
+            f"[HIK SYNC] Rymnet rejected whole batch — saved as pending, will auto-retry.\n"
+            f"Window: {window}\n{label}\n"
+            f"If it keeps failing (poison record): uv run debug_pending.py --send"
+        )
         return True, 0
 
     if bad:
-        _log_rejected(bad, window)
+        path = _log_rejected(bad, window)
+        notify(
+            f"[HIK SYNC] {len(bad)} record(s) rejected by Rymnet — dropped from window {window}.\n"
+            f"Logged to {path}\n"
+            f"To fix & resend: edit the file, then uv run debug_pending.py --send {path}"
+        )
     checkpoint.save_page(signature, max(pages))
     return False, len(good)
 
@@ -236,7 +247,10 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
                     return False, 0
     except Exception as e:
         logger.error(f"Hik fetch error: {e} — stopping. Re-run to resume.")
-        notify(f"[HIK SYNC] Hikvision fetch error — stopped, checkpoint saved.\nWindow: {start} → {end}\nError: {e}")
+        notify(
+            f"[HIK SYNC] Hikvision fetch error — stopped, checkpoint saved (auto-resumes next run).\n"
+            f"Window: {start} → {end}\nError: {e}"
+        )
         return False, 0
 
     if not flush():
@@ -282,7 +296,11 @@ def _retry_failed_windows() -> int:
     if gave_up:
         lines = "\n".join(f"{it['start']} → {it['end']}" for it in gave_up)
         logger.error(f"Gave up on {len(gave_up)} window(s) after {MAX_WINDOW_RETRIES} retries")
-        notify(f"[HIK SYNC] Gave up on {len(gave_up)} window(s) after {MAX_WINDOW_RETRIES} retries — manual intervention needed:\n{lines}")
+        notify(
+            f"[HIK SYNC] Gave up on {len(gave_up)} window(s) after {MAX_WINDOW_RETRIES} retries — manual intervention needed:\n{lines}\n"
+            f"Retry (transient outage): uv run main.py --recover-windows\n"
+            f"Isolate poison records:   uv run debug_pending.py --send"
+        )
     return sent
 
 

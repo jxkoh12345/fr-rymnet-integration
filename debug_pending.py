@@ -105,6 +105,8 @@ def main():
     if args.file:
         with open(args.file, encoding='utf-8') as f:
             records = json.load(f)
+        # rejected_*.json wraps each as {"window":..., "record":{...}}; unwrap to bare records
+        records = [r['record'] if isinstance(r, dict) and 'record' in r else r for r in records]
         if not records:
             print("File has no records.")
             return
