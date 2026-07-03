@@ -23,7 +23,8 @@ def _run(events):
          patch('main.checkpoint.load_checkpoint', return_value=0), \
          patch('main.checkpoint.save_page'), \
          patch('main.checkpoint.clear_window'), \
-         patch('main.notify'):
+         patch('main.notify'), \
+         patch('main._log_attendance'):
         main.run_window('2026-01-01T08:00:00+08:00', '2026-01-01T08:30:00+08:00')
 
     return sent

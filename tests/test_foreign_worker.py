@@ -22,6 +22,7 @@ def _run(events, foreign_worker: bool):
          patch('main.checkpoint.save_page'), \
          patch('main.checkpoint.clear_window'), \
          patch('main.notify'), \
+         patch('main._log_attendance'), \
          patch.object(main, 'FOREIGN_WORKER', foreign_worker):
         main.run_window('2026-01-01T08:00:00+08:00', '2026-01-01T08:30:00+08:00')
     return sent

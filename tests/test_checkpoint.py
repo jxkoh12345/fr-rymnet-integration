@@ -78,9 +78,11 @@ class StateTestBase(unittest.TestCase):
         self._orig_delay  = main.SEND_RETRY_DELAY
         self._orig_maxret = main.MAX_WINDOW_RETRIES
         self._orig_notify = main.notify
+        self._orig_logdir = main.LOG_DIR
         main.fetch_person_info = lambda pid: {'personCode': f'E_{pid}'}
         main.SEND_RETRY_DELAY = 0
         main.notify = lambda *a, **k: None   # never hit real Lark in tests
+        main.LOG_DIR = os.path.join(self._tmp.name, 'logs')  # don't touch real logs/
         self.sig = checkpoint.query_signature(START, END, main.DOORS, main.EVENT_TYPE)
 
     def tearDown(self):
@@ -90,6 +92,7 @@ class StateTestBase(unittest.TestCase):
         main.SEND_RETRY_DELAY  = self._orig_delay
         main.MAX_WINDOW_RETRIES = self._orig_maxret
         main.notify        = self._orig_notify
+        main.LOG_DIR       = self._orig_logdir
         self._tmp.cleanup()
 
     def run_window(self, reset=False):
@@ -158,6 +161,53 @@ class MainFlowTests(StateTestBase):
         self.assertEqual([len(c) for c in fake.calls], [100, 100])
         self.assertEqual(checkpoint.load_checkpoint(self.sig), 0)  # cleared
         self.assertIsNone(checkpoint.load_pending(self.sig))
+
+    def test_attendance_staged_to_jsonl_before_send(self):
+        main.iter_pages = FakeIterPages(total_pages=2)  # 100 events
+        main.send = FakeSend()
+
+        self.run_window()
+
+        files = glob.glob(os.path.join(main.LOG_DIR, 'attendance_*.jsonl'))
+        self.assertEqual(len(files), 1)
+        with open(files[0], encoding='utf-8') as f:
+            lines = f.read().splitlines()
+        self.assertEqual(len(lines), 100)                  # one line per record
+        rec = json.loads(lines[0])
+        self.assertEqual(
+            set(rec),
+            {'employee_no', 'logtime', 'indicator', 'location', 'remarks', 'duplicate'},
+        )
+        self.assertFalse(rec['duplicate'])                 # no dupes among 100 distinct people
+
+    def test_attendance_staged_even_when_send_fails(self):
+        main.iter_pages = FakeIterPages(total_pages=2)
+        main.send = FakeSend(max_success=0)   # every send fails
+
+        self.run_window()
+
+        files = glob.glob(os.path.join(main.LOG_DIR, 'attendance_*.jsonl'))
+        self.assertEqual(len(files), 1)
+        with open(files[0], encoding='utf-8') as f:
+            self.assertEqual(len(f.read().splitlines()), 100)  # staged before the send
+
+    def test_duplicate_records_staged_but_not_sent(self):
+        # same person, same logtime, twice -> the 2nd is a duplicate
+        main.iter_pages = lambda **kw: iter([(1, [make_event(1, 0), make_event(1, 0)])])
+        fake = FakeSend()
+        main.send = fake
+
+        ok, n = self.run_window()
+
+        self.assertTrue(ok)
+        self.assertEqual(n, 1)                      # duplicate excluded from what's sent
+        self.assertEqual(len(fake.calls[0]), 1)
+
+        files = glob.glob(os.path.join(main.LOG_DIR, 'attendance_*.jsonl'))
+        with open(files[0], encoding='utf-8') as f:
+            logged = [json.loads(line) for line in f.read().splitlines()]
+        self.assertEqual(len(logged), 2)             # both staged for audit
+        self.assertEqual([r['duplicate'] for r in logged], [False, True])
 
     def test_send_failure_returns_false_and_saves_pending(self):
         main.iter_pages = FakeIterPages(total_pages=4)

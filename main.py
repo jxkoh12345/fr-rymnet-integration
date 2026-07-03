@@ -35,6 +35,7 @@ MASK_STATUS   = -1
 SORT_FIELD    = 'SwipeTime'
 ORDER_TYPE    = 1
 BATCH_SIZE    = 100
+LOG_DIR       = 'logs'  # staging sink for attendance records before send (temp until DB)
 EVENT_TEST    = os.environ.get('EVENT_TEST', '')
 SEND_RETRIES  = 3
 SEND_RETRY_DELAY = 2   # seconds between send retries
@@ -85,6 +86,18 @@ def _log_rejected(records: list, window: str) -> str:
         json.dump([{'window': window, 'record': r} for r in records], f, ensure_ascii=False, indent=2)
     logger.error(f"{len(records)} record(s) rejected by Rymnet — logged to {path}")
     return path
+
+
+def _log_attendance(records: list):
+    """Stage attendance records to LOG_DIR/attendance_<date>.jsonl before sending.
+    Temporary sink (one JSON object per line) until a DB replaces it."""
+    if not records:
+        return
+    os.makedirs(LOG_DIR, exist_ok=True)
+    path = os.path.join(LOG_DIR, f"attendance_{datetime.now():%Y%m%d}.jsonl")
+    with open(path, 'a', encoding='utf-8') as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + '\n')
 
 
 def _send_resilient(records: list, pages: list, signature: dict, window: str) -> tuple[bool, int]:
@@ -208,35 +221,44 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
             start_page=resume_page,
         ):
             bodies = [_resolve_record(e, person_cache) for e in events]
+            for record in bodies:
+                if record.get('employee_no', '').startswith('FW'):
+                    record['employee_no'] = 'FW-' + record['employee_no'][2:]
+
             deduped = []
+            audited = []
             for record in bodies:
                 if EVENT_TEST and record.get('employee_no') == EVENT_TEST:
                     notify(f"[HIK SYNC] Event found:\n{json.dumps(record, indent=2)}")
                 emp = record.get('employee_no', '')
                 logtime_str = record.get('logtime', '')
+                is_dup = False
                 if emp:
                     try:
                         t = datetime.strptime(logtime_str, '%Y-%m-%d %H:%M:%S')
                         if emp in last_sent and abs((t - last_sent[emp]).total_seconds()) < MIN_GAP_MINUTES * 60:
                             dupes += 1
+                            is_dup = True
                             logger.debug(f"Duplicate skipped (<{MIN_GAP_MINUTES}min gap): employee_no={emp} logtime={logtime_str}")
-                            continue
-                        last_sent[emp] = t
+                        else:
+                            last_sent[emp] = t
                     except ValueError:
                         pass
                 else:
                     key = (emp, logtime_str)
                     if key in seen:
                         dupes += 1
+                        is_dup = True
                         logger.debug(f"Duplicate skipped: employee_no={emp} logtime={logtime_str}")
-                        continue
-                    seen.add(key)
-                deduped.append(record)
-            for rec in deduped:
-                if rec.get('employee_no', '').startswith('FW'):
-                    rec['employee_no'] = 'FW-' + rec['employee_no'][2:]
+                    else:
+                        seen.add(key)
+                audited.append({**record, 'duplicate': is_dup})
+                if not is_dup:
+                    deduped.append(record)
             if FOREIGN_WORKER:
                 deduped = [rec for rec in deduped if rec.get('employee_no', '').startswith('FW-')]
+                audited = [rec for rec in audited if rec.get('employee_no', '').startswith('FW-')]
+            _log_attendance(audited)
             if batch and len(batch) + len(deduped) > BATCH_SIZE:
                 if not flush():
                     return False, 0
