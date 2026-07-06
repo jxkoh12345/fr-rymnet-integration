@@ -25,6 +25,7 @@ import re
 from datetime import datetime
 
 import db
+import sendlock
 from signature.final_data import send
 
 _WINDOWS = os.path.join('state', 'windows', '*.json')
@@ -67,8 +68,10 @@ def inspect(records: list):
         print("  No obvious structural problems - run with --send to isolate by sending.")
 
 
+@sendlock.locked
 def send_each(records: list) -> list:
-    """Send every record on its own; return the indices of the ones Rymnet rejects."""
+    """Send every record on its own; return the indices of the ones Rymnet rejects.
+    Holds the cross-process send lock so it can't run concurrently with the daemon."""
     failed_idx = []
     for i, rec in enumerate(records, 1):
         try:

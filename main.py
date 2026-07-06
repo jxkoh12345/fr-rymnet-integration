@@ -11,6 +11,7 @@ from signature.final_data import send, build_body
 from DoorList import DoorList
 import checkpoint
 import db
+import sendlock
 from notifier import notify
 
 # --- Logger setup ---
@@ -219,9 +220,11 @@ def _prepare_page(events: list, person_cache: dict, seen: set, last_sent: dict) 
     return audited, deduped, dupes
 
 
+@sendlock.locked
 def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
     """Fetch events in [start, end] and send to Rymnet, with checkpointing.
-    Returns (ok, records_sent). ok is False if the window did not complete."""
+    Returns (ok, records_sent). ok is False if the window did not complete.
+    Holds the cross-process send lock so no other process sends concurrently."""
     cycle_start = time.perf_counter()
     logger.info(f"=== Window {start} → {end} ===")
 
@@ -317,6 +320,10 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
     checkpoint.clear_window(signature)  # completed — no longer needs to rerun
     elapsed = time.perf_counter() - cycle_start
     logger.info(f"=== Window done — {total} records sent, {dupes} duplicates skipped in {elapsed:.2f}s ===")
+    notify(
+        f"[HIK SYNC] Window done: {start} → {end}\n"
+        f"{total} records sent, {dupes} duplicates skipped, {elapsed:.2f}s"
+    )
     return True, total
 
 
