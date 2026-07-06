@@ -19,8 +19,12 @@ def main():
         print("No window files in state/windows/.")
         return
     for path in files:
-        with open(path, encoding='utf-8') as f:
-            data = json.load(f)
+        try:
+            with open(path, encoding='utf-8') as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"{os.path.basename(path)}: UNREADABLE ({e})")
+            continue
         q = data.get('query', {})
         pending = 'YES' if data.get('pending') else 'no'
         print(f"{os.path.basename(path)}: {q.get('start')} -> {q.get('end')}  page={data.get('page')}  pending={pending}")
