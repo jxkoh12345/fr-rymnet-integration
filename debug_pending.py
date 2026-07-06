@@ -17,12 +17,14 @@ Usage:
   uv run debug_pending.py --send FILE  # ad-hoc: send records from a JSON file (a list)
 """
 import argparse
+import getpass
 import glob
 import json
 import os
 import re
 from datetime import datetime
 
+import db
 from signature.final_data import send
 
 _WINDOWS = os.path.join('state', 'windows', '*.json')
@@ -30,13 +32,16 @@ _TIME_RE = re.compile(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$')
 
 
 def _pending_windows():
-    """Yield (path, pages, records) for each window file holding a pending batch."""
+    """Yield (path, pages, records, ids) for each window file holding a pending batch.
+    `ids` are the hik_records ids aligned with records (None entries if unknown)."""
     for path in sorted(glob.glob(_WINDOWS)):
         with open(path, encoding='utf-8') as f:
             data = json.load(f)
         pending = data.get('pending')
         if pending and pending.get('records'):
-            yield path, pending.get('pages') or [], pending['records']
+            records = pending['records']
+            ids = pending.get('ids') or [None] * len(records)
+            yield path, pending.get('pages') or [], records, ids
 
 
 def _issues(rec: dict) -> list:
@@ -63,16 +68,16 @@ def inspect(records: list):
 
 
 def send_each(records: list) -> list:
-    """Send every record on its own; return the ones Rymnet rejects."""
-    failed = []
+    """Send every record on its own; return the indices of the ones Rymnet rejects."""
+    failed_idx = []
     for i, rec in enumerate(records, 1):
         try:
             send([rec])
             print(f"  [{i}/{len(records)}] OK   {rec.get('employee_no')} {rec.get('logtime')}")
         except Exception as e:
             print(f"  [{i}/{len(records)}] FAIL {rec.get('employee_no')} {rec.get('logtime')}\n        {e}")
-            failed.append(rec)
-    return failed
+            failed_idx.append(i - 1)
+    return failed_idx
 
 
 def _log_bad(failed: list) -> str:
@@ -100,6 +105,7 @@ def main():
     parser.add_argument('file', nargs='?',
                         help="JSON file with a list of records; default scans state/windows/")
     args = parser.parse_args()
+    db.ACTOR = getpass.getuser()   # manual run — status updates audit as the user
 
     # ad-hoc file mode: no state to unstick, just inspect or send
     if args.file:
@@ -112,7 +118,7 @@ def main():
             return
         print(f"Loaded {len(records)} records from {args.file}.")
         if args.send:
-            failed = send_each(records)
+            failed = [records[i] for i in send_each(records)]
             print(f"\n=== {len(failed)}/{len(records)} rejected by Rymnet ===")
             if failed:
                 print(f"Rejected records -> {_log_bad(failed)}")
@@ -126,13 +132,17 @@ def main():
         print("No pending batches in state/windows/.")
         return
 
-    for path, pages, records in windows:
+    for path, pages, records, ids in windows:
         print(f"\n=== {path}: {len(records)} pending records (pages {pages}) ===")
         if not args.send:
             inspect(records)
             continue
-        failed = send_each(records)
+        failed_idx = set(send_each(records))
+        failed = [records[i] for i in failed_idx]
         print(f"  {len(failed)}/{len(records)} rejected by Rymnet")
+        # mirror outcomes to hik_record_status (modified_by = this user)
+        db.set_status([ids[i] for i in range(len(records)) if i not in failed_idx], db.STATUS_SUCCESS)
+        db.set_status([ids[i] for i in failed_idx], db.STATUS_FAILED)
         if failed:
             print(f"  Rejected records -> {_log_bad(failed)}")
         _unstick(path, pages)

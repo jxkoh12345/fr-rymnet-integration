@@ -24,7 +24,9 @@ def _run(events):
          patch('main.checkpoint.save_page'), \
          patch('main.checkpoint.clear_window'), \
          patch('main.notify'), \
-         patch('main._log_attendance'):
+         patch('main._log_attendance'), \
+         patch.object(main.db, 'insert_records', lambda recs: [None] * len(recs)), \
+         patch.object(main.db, 'set_status', lambda *a, **k: None):
         main.run_window('2026-01-01T08:00:00+08:00', '2026-01-01T08:30:00+08:00')
 
     return sent

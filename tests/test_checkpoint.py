@@ -10,6 +10,7 @@ import tempfile
 import unittest
 
 import checkpoint
+import db
 import main
 
 START = '2026-04-01T00:00:00+08:00'
@@ -79,10 +80,14 @@ class StateTestBase(unittest.TestCase):
         self._orig_maxret = main.MAX_WINDOW_RETRIES
         self._orig_notify = main.notify
         self._orig_logdir = main.LOG_DIR
+        self._orig_db_ins = main.db.insert_records
+        self._orig_db_set = main.db.set_status
         main.fetch_person_info = lambda pid: {'personCode': f'E_{pid}'}
         main.SEND_RETRY_DELAY = 0
         main.notify = lambda *a, **k: None   # never hit real Lark in tests
         main.LOG_DIR = os.path.join(self._tmp.name, 'logs')  # don't touch real logs/
+        main.db.insert_records = lambda recs: [None] * len(recs)   # never hit real DB
+        main.db.set_status = lambda ids, status: None
         self.sig = checkpoint.query_signature(START, END, main.DOORS, main.EVENT_TYPE)
 
     def tearDown(self):
@@ -93,6 +98,8 @@ class StateTestBase(unittest.TestCase):
         main.MAX_WINDOW_RETRIES = self._orig_maxret
         main.notify        = self._orig_notify
         main.LOG_DIR       = self._orig_logdir
+        main.db.insert_records = self._orig_db_ins
+        main.db.set_status     = self._orig_db_set
         self._tmp.cleanup()
 
     def run_window(self, reset=False):
@@ -404,6 +411,84 @@ class PerRecordIsolationTests(StateTestBase):
         # notified about the whole-batch rejection, with the isolate command
         self.assertEqual(len(notes), 1)
         self.assertIn('debug_pending.py --send', notes[0])
+
+
+class DbStatusTests(StateTestBase):
+    """hik_records / hik_record_status mirroring (db module stubbed with recorders)."""
+
+    def setUp(self):
+        super().setUp()
+        self._id = 0
+        self.inserted = []      # records passed to insert_records
+        self.status_calls = []  # (ids, status)
+
+        def fake_insert(recs):
+            self.inserted.extend(recs)
+            ids = list(range(self._id + 1, self._id + 1 + len(recs)))
+            self._id += len(recs)
+            return ids
+
+        main.db.insert_records = fake_insert
+        main.db.set_status = lambda ids, status: self.status_calls.append((list(ids), status))
+
+    def test_all_records_inserted_and_success_status_for_sent(self):
+        main.iter_pages = FakeIterPages(total_pages=2)  # 100 events, no dups
+        main.send = FakeSend()
+
+        ok, n = self.run_window()
+
+        self.assertTrue(ok)
+        self.assertEqual(len(self.inserted), 100)                 # every record hits hik_records
+        self.assertEqual(self.status_calls, [(list(range(1, 101)), db.STATUS_SUCCESS)])
+
+    def test_duplicates_inserted_but_get_no_status(self):
+        # same person twice -> 2nd is dup: both in hik_records, only 1 in status
+        main.iter_pages = lambda **kw: iter([(1, [make_event(1, 0), make_event(1, 0)])])
+        main.send = FakeSend()
+
+        self.run_window()
+
+        self.assertEqual(len(self.inserted), 2)
+        self.assertEqual([r['duplicate'] for r in self.inserted], [False, True])
+        self.assertEqual(self.status_calls, [([1], db.STATUS_SUCCESS)])  # dup id 2 has no status
+
+    def test_pending_status_saved_with_ids_then_updated_on_retry(self):
+        main.iter_pages = FakeIterPages(total_pages=2)
+        main.send = FakeSend(max_success=0)   # everything fails -> pending
+
+        ok, _ = self.run_window()
+
+        self.assertFalse(ok)
+        self.assertEqual(self.status_calls, [(list(range(1, 101)), db.STATUS_PENDING)])
+        self.assertEqual(checkpoint.load_pending(self.sig)['ids'], list(range(1, 101)))
+
+        # retry succeeds -> same ids move PENDING -> SUCCESS (no re-insert)
+        self.status_calls.clear()
+        inserted_before = len(self.inserted)
+        main.iter_pages = FakeIterPages(total_pages=2)
+        main.send = FakeSend()
+
+        ok, _ = self.run_window()
+
+        self.assertTrue(ok)
+        self.assertEqual(self.status_calls[0], (list(range(1, 101)), db.STATUS_SUCCESS))
+        self.assertEqual(len(self.inserted), inserted_before)  # pending retry doesn't re-insert
+
+    def test_mixed_isolation_marks_failed_and_success(self):
+        main.iter_pages = FakeIterPages(total_pages=2)
+        main.send = FakeSelectiveSend({'E_p1_5', 'E_p2_10'})
+
+        orig_cwd = os.getcwd()
+        os.chdir(self._tmp.name)   # errors/rejected_*.json goes to temp
+        try:
+            ok, n = self.run_window()
+        finally:
+            os.chdir(orig_cwd)
+
+        self.assertTrue(ok)
+        by_status = {s: ids for ids, s in self.status_calls}
+        self.assertEqual(len(by_status[db.STATUS_FAILED]), 2)
+        self.assertEqual(len(by_status[db.STATUS_SUCCESS]), 98)
 
 
 if __name__ == '__main__':

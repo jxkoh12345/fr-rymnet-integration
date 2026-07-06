@@ -71,12 +71,13 @@ def save_page(signature: dict, page: int):
 
 
 def load_pending(signature: dict):
-    """The unsent batch {pages, records} for this window, or None."""
+    """The unsent batch {pages, records, ids} for this window, or None."""
     return _load(signature)['pending']
 
 
-def save_pending(signature: dict, pages: list, records: list):
-    _save(signature, _load(signature)['page'], {'pages': pages, 'records': records})
+def save_pending(signature: dict, pages: list, records: list, ids: list = None):
+    """`ids` = hik_records ids aligned with records (for status updates on retry)."""
+    _save(signature, _load(signature)['page'], {'pages': pages, 'records': records, 'ids': ids})
 
 
 def clear_pending(signature: dict):

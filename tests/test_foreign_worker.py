@@ -23,6 +23,8 @@ def _run(events, foreign_worker: bool):
          patch('main.checkpoint.clear_window'), \
          patch('main.notify'), \
          patch('main._log_attendance'), \
+         patch.object(main.db, 'insert_records', lambda recs: [None] * len(recs)), \
+         patch.object(main.db, 'set_status', lambda *a, **k: None), \
          patch.object(main, 'FOREIGN_WORKER', foreign_worker):
         main.run_window('2026-01-01T08:00:00+08:00', '2026-01-01T08:30:00+08:00')
     return sent

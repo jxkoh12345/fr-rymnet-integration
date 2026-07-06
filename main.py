@@ -1,4 +1,5 @@
 import argparse
+import getpass
 import logging
 import json
 import os
@@ -9,6 +10,7 @@ from signature.personId import fetch_person_info
 from signature.final_data import send, build_body
 from DoorList import DoorList
 import checkpoint
+import db
 from notifier import notify
 
 # --- Logger setup ---
@@ -100,31 +102,39 @@ def _log_attendance(records: list):
             f.write(json.dumps(r, ensure_ascii=False) + '\n')
 
 
-def _send_resilient(records: list, pages: list, signature: dict, window: str) -> tuple[bool, int]:
+def _send_resilient(records: list, pages: list, signature: dict, window: str, ids: list = None) -> tuple[bool, int]:
     """Send a batch; if it fails, isolate per-record so one poison record can't
     block the rest. Returns (should_stop, num_sent).
 
       batch OK                     -> (False, len(records))
       fails, none send alone       -> outage: pending saved, (True, 0)
       fails, some send alone       -> log+drop the rest, advance page, (False, num_good)
+
+    `ids` = hik_records ids aligned with records; outcomes are mirrored to
+    hik_record_status (SUCCESS / PENDING / FAILED).
     """
+    ids = ids if ids is not None else [None] * len(records)
     label = f"pages {pages} ({len(records)} records)"
     ok, _ = _send_with_retry(records, f"Batch {label}")
     if ok:
+        db.set_status(ids, db.STATUS_SUCCESS)
         checkpoint.save_page(signature, max(pages))
         return False, len(records)
 
     logger.warning(f"Batch {label} failed — isolating per-record")
-    good, bad = [], []
-    for rec in records:
+    good, bad, good_ids, bad_ids = [], [], [], []
+    for rec, rid in zip(records, ids):
         try:
             send([rec])
             good.append(rec)
+            good_ids.append(rid)
         except Exception:
             bad.append(rec)
+            bad_ids.append(rid)
 
     if not good:
-        checkpoint.save_pending(signature, pages, records)
+        checkpoint.save_pending(signature, pages, records, ids)
+        db.set_status(ids, db.STATUS_PENDING)
         logger.error(f"Batch {label}: no records accepted individually — saved as pending, stopping.")
         notify(
             f"[HIK SYNC] Rymnet rejected whole batch — saved as pending, will auto-retry.\n"
@@ -135,11 +145,13 @@ def _send_resilient(records: list, pages: list, signature: dict, window: str) ->
 
     if bad:
         path = _log_rejected(bad, window)
+        db.set_status(bad_ids, db.STATUS_FAILED)
         notify(
             f"[HIK SYNC] {len(bad)} record(s) rejected by Rymnet — dropped from window {window}.\n"
             f"Logged to {path}\n"
             f"To fix & resend: edit the file, then uv run debug_pending.py --send {path}"
         )
+    db.set_status(good_ids, db.STATUS_SUCCESS)
     checkpoint.save_page(signature, max(pages))
     return False, len(good)
 
@@ -161,6 +173,52 @@ def _resolve_record(item: dict, person_cache: dict) -> dict:
     )
 
 
+def _prepare_page(events: list, person_cache: dict, seen: set, last_sent: dict) -> tuple[list, list, int]:
+    """Resolve a page of events into request bodies, normalize FW prefixes and
+    mark duplicates. Returns (audited, deduped, dupes):
+      audited — every record tagged with 'duplicate' (audit trail)
+      deduped — the records to actually send
+    Honors FOREIGN_WORKER by filtering both lists."""
+    bodies = [_resolve_record(e, person_cache) for e in events]
+    for record in bodies:
+        if record.get('employee_no', '').startswith('FW'):
+            record['employee_no'] = 'FW-' + record['employee_no'][2:]
+
+    audited, deduped, dupes = [], [], 0
+    for record in bodies:
+        if EVENT_TEST and record.get('employee_no') == EVENT_TEST:
+            notify(f"[HIK SYNC] Event found:\n{json.dumps(record, indent=2)}")
+        emp = record.get('employee_no', '')
+        logtime_str = record.get('logtime', '')
+        is_dup = False
+        if emp:
+            try:
+                t = datetime.strptime(logtime_str, '%Y-%m-%d %H:%M:%S')
+                if emp in last_sent and abs((t - last_sent[emp]).total_seconds()) < MIN_GAP_MINUTES * 60:
+                    dupes += 1
+                    is_dup = True
+                    logger.debug(f"Duplicate skipped (<{MIN_GAP_MINUTES}min gap): employee_no={emp} logtime={logtime_str}")
+                else:
+                    last_sent[emp] = t
+            except ValueError:
+                pass
+        else:
+            key = (emp, logtime_str)
+            if key in seen:
+                dupes += 1
+                is_dup = True
+                logger.debug(f"Duplicate skipped: employee_no={emp} logtime={logtime_str}")
+            else:
+                seen.add(key)
+        audited.append({**record, 'duplicate': is_dup})
+        if not is_dup:
+            deduped.append(record)
+    if FOREIGN_WORKER:
+        audited = [rec for rec in audited if rec.get('employee_no', '').startswith('FW-')]
+        deduped = [rec for rec in deduped if rec.get('employee_no', '').startswith('FW-')]
+    return audited, deduped, dupes
+
+
 def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
     """Fetch events in [start, end] and send to Rymnet, with checkpointing.
     Returns (ok, records_sent). ok is False if the window did not complete."""
@@ -177,7 +235,7 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
     pending = checkpoint.load_pending(signature)
     if pending:
         logger.info(f"Retrying pending batch (pages {pending['pages']}, {len(pending['records'])} records)")
-        stop, _ = _send_resilient(pending['records'], pending['pages'], signature, f"{start} → {end}")
+        stop, _ = _send_resilient(pending['records'], pending['pages'], signature, f"{start} → {end}", pending.get('ids'))
         if stop:
             return False, 0
         checkpoint.clear_pending(signature)
@@ -189,19 +247,21 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
     seen: set         = set()   # exact dedup fallback for empty employee_no
     last_sent: dict   = {}      # employee_no → last sent datetime
     batch: list       = []
+    batch_ids: list   = []      # hik_records ids aligned with batch
     batch_pages: list = []
     total             = 0
     dupes             = 0
 
     def flush() -> bool:
-        nonlocal batch, batch_pages, total
+        nonlocal batch, batch_ids, batch_pages, total
         if not batch:
             return True
-        stop, sent = _send_resilient(batch, batch_pages, signature, f"{start} → {end}")
+        stop, sent = _send_resilient(batch, batch_pages, signature, f"{start} → {end}", batch_ids)
         if stop:
             return False
         total += sent
         batch.clear()
+        batch_ids.clear()
         batch_pages.clear()
         return True
 
@@ -220,49 +280,16 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
             order_type=ORDER_TYPE,
             start_page=resume_page,
         ):
-            bodies = [_resolve_record(e, person_cache) for e in events]
-            for record in bodies:
-                if record.get('employee_no', '').startswith('FW'):
-                    record['employee_no'] = 'FW-' + record['employee_no'][2:]
-
-            deduped = []
-            audited = []
-            for record in bodies:
-                if EVENT_TEST and record.get('employee_no') == EVENT_TEST:
-                    notify(f"[HIK SYNC] Event found:\n{json.dumps(record, indent=2)}")
-                emp = record.get('employee_no', '')
-                logtime_str = record.get('logtime', '')
-                is_dup = False
-                if emp:
-                    try:
-                        t = datetime.strptime(logtime_str, '%Y-%m-%d %H:%M:%S')
-                        if emp in last_sent and abs((t - last_sent[emp]).total_seconds()) < MIN_GAP_MINUTES * 60:
-                            dupes += 1
-                            is_dup = True
-                            logger.debug(f"Duplicate skipped (<{MIN_GAP_MINUTES}min gap): employee_no={emp} logtime={logtime_str}")
-                        else:
-                            last_sent[emp] = t
-                    except ValueError:
-                        pass
-                else:
-                    key = (emp, logtime_str)
-                    if key in seen:
-                        dupes += 1
-                        is_dup = True
-                        logger.debug(f"Duplicate skipped: employee_no={emp} logtime={logtime_str}")
-                    else:
-                        seen.add(key)
-                audited.append({**record, 'duplicate': is_dup})
-                if not is_dup:
-                    deduped.append(record)
-            if FOREIGN_WORKER:
-                deduped = [rec for rec in deduped if rec.get('employee_no', '').startswith('FW-')]
-                audited = [rec for rec in audited if rec.get('employee_no', '').startswith('FW-')]
+            audited, deduped, page_dupes = _prepare_page(events, person_cache, seen, last_sent)
+            dupes += page_dupes
             _log_attendance(audited)
+            record_ids = db.insert_records(audited)
+            deduped_ids = [rid for rid, rec in zip(record_ids, audited) if not rec['duplicate']]
             if batch and len(batch) + len(deduped) > BATCH_SIZE:
                 if not flush():
                     return False, 0
             batch.extend(deduped)
+            batch_ids.extend(deduped_ids)
             batch_pages.append(page_no)
             if len(batch) >= BATCH_SIZE:
                 if not flush():
@@ -316,6 +343,12 @@ def _retry_failed_windows() -> int:
             remaining.append(it)
     checkpoint.save_failed(remaining)
     if gave_up:
+        # mark the stuck pending records FAILED in the DB
+        for it in gave_up:
+            sig = checkpoint.query_signature(it['start'], it['end'], DOORS, EVENT_TYPE)
+            stuck = checkpoint.load_pending(sig)
+            if stuck and stuck.get('ids'):
+                db.set_status(stuck['ids'], db.STATUS_FAILED)
         lines = "\n".join(f"{it['start']} → {it['end']}" for it in gave_up)
         logger.error(f"Gave up on {len(gave_up)} window(s) after {MAX_WINDOW_RETRIES} retries")
         notify(
@@ -397,12 +430,14 @@ if __name__ == '__main__':
         raise SystemExit(0)
 
     if args.recover_windows:
+        db.ACTOR = getpass.getuser()   # manual rerun — audit as the user
         recover_windows()
         raise SystemExit(0)
 
     if args.start or args.end:
         if not (args.start and args.end):
             parser.error("--start and --end must be used together")
+        db.ACTOR = getpass.getuser()   # manual rerun — audit as the user
         run_window(
             start=args.start if '+' in args.start else args.start + TIMEZONE,
             end=args.end   if '+' in args.end   else args.end   + TIMEZONE,
