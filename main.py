@@ -283,7 +283,16 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
             audited, deduped, page_dupes = _prepare_page(events, person_cache, seen, last_sent)
             dupes += page_dupes
             _log_attendance(audited)
-            record_ids = db.insert_records(audited)
+            try:
+                record_ids = db.insert_records(audited)
+                failed = sum(1 for r in record_ids if r is None)
+                if failed:
+                    logger.error(f"DB insert: {failed}/{len(record_ids)} record(s) failed on page {page_no}")
+                else:
+                    logger.info(f"DB insert: {len(record_ids)} record(s) inserted on page {page_no}")
+            except Exception as e:
+                logger.error(f"DB insert_records call failed: {e}")
+                record_ids = [None] * len(audited)
             deduped_ids = [rid for rid, rec in zip(record_ids, audited) if not rec['duplicate']]
             if batch and len(batch) + len(deduped) > BATCH_SIZE:
                 if not flush():
