@@ -191,16 +191,18 @@ def _prepare_page(events: list, person_cache: dict, seen: set, last_sent: dict) 
             notify(f"[HIK SYNC] Event found:\n{json.dumps(record, indent=2)}")
         emp = record.get('employee_no', '')
         logtime_str = record.get('logtime', '')
+        indicator = record.get('indicator', '')
         is_dup = False
         if emp:
+            key = (emp, indicator)
             try:
                 t = datetime.strptime(logtime_str, '%Y-%m-%d %H:%M:%S')
-                if emp in last_sent and abs((t - last_sent[emp]).total_seconds()) < MIN_GAP_MINUTES * 60:
+                if key in last_sent and abs((t - last_sent[key]).total_seconds()) < MIN_GAP_MINUTES * 60:
                     dupes += 1
                     is_dup = True
-                    logger.debug(f"Duplicate skipped (<{MIN_GAP_MINUTES}min gap): employee_no={emp} logtime={logtime_str}")
+                    logger.debug(f"Duplicate skipped (<{MIN_GAP_MINUTES}min gap): employee_no={emp} indicator={indicator} logtime={logtime_str}")
                 else:
-                    last_sent[emp] = t
+                    last_sent[key] = t
             except ValueError:
                 pass
         else:
@@ -248,7 +250,7 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
 
     person_cache: dict = {}
     seen: set         = set()   # exact dedup fallback for empty employee_no
-    last_sent: dict   = {}      # employee_no → last sent datetime
+    last_sent: dict   = {}      # (employee_no, indicator) → last sent datetime
     batch: list       = []
     batch_ids: list   = []      # hik_records ids aligned with batch
     batch_pages: list = []

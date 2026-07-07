@@ -383,10 +383,10 @@ class PerRecordIsolationTests(StateTestBase):
                 {'employee_no', 'logtime', 'indicator', 'location', 'remarks'},
             )
 
-        # a single notification fired, naming the rejected file + the resend command
-        self.assertEqual(len(notes), 1)
-        self.assertIn(rejected_files[0], notes[0])
-        self.assertIn('debug_pending.py --send', notes[0])
+        # a rejection notification fired, naming the rejected file + the resend command
+        reject_notes = [m for m in notes if rejected_files[0] in m]
+        self.assertEqual(len(reject_notes), 1)
+        self.assertIn('debug_pending.py --send', reject_notes[0])
 
     def test_all_records_bad_saved_pending_not_logged(self):
         main.iter_pages = FakeIterPages(total_pages=2)

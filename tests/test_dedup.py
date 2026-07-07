@@ -32,8 +32,8 @@ def _run(events):
     return sent
 
 
-def r(emp, logtime):
-    return {'employee_no': emp, 'logtime': logtime, 'location': '', 'indicator': '', 'remarks': ''}
+def r(emp, logtime, indicator=''):
+    return {'employee_no': emp, 'logtime': logtime, 'location': '', 'indicator': indicator, 'remarks': ''}
 
 
 # --- same employee ---
@@ -89,6 +89,30 @@ def test_different_employees_independent_gaps():
     emps = [s['employee_no'] for s in sent]
     assert emps.count('E001') == 1
     assert emps.count('E002') == 2
+
+
+# --- indicator (only dedup same direction) ---
+
+def test_same_indicator_within_5min_skipped():
+    sent = _run([r('E001', '2026-01-01 08:00:00', 'IN'),
+                 r('E001', '2026-01-01 08:02:00', 'IN')])
+    assert len(sent) == 1
+
+
+def test_different_indicator_within_5min_both_sent():
+    # IN then OUT within the gap — different direction, not a duplicate
+    sent = _run([r('E001', '2026-01-01 08:00:00', 'IN'),
+                 r('E001', '2026-01-01 08:02:00', 'OUT')])
+    assert len(sent) == 2
+
+
+def test_indicator_gaps_independent():
+    sent = _run([r('E001', '2026-01-01 08:00:00', 'IN'),
+                 r('E001', '2026-01-01 08:01:00', 'OUT'),   # sent — different indicator
+                 r('E001', '2026-01-01 08:02:00', 'IN'),    # skipped — within 5min of IN@08:00
+                 r('E001', '2026-01-01 08:03:00', 'OUT'),   # skipped — within 5min of OUT@08:01
+                 ])
+    assert len(sent) == 2
 
 
 # --- empty employee_no (exact dedup fallback) ---
