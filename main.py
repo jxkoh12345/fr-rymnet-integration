@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from signature.door_events import iter_pages
 from signature.personId import fetch_person_info
 from signature.final_data import send, build_body
+from signature.rymnet_employee import employee_exists
 from DoorList import DoorList
 import checkpoint
 import db
@@ -18,13 +19,7 @@ from notifier import notify
 os.makedirs('errors', exist_ok=True)
 error_handler = logging.FileHandler('errors/errors.log', encoding='utf-8')
 error_handler.setLevel(logging.ERROR)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[logging.StreamHandler(), error_handler],
-)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)  # handlers attached in __main__ once --output-dir is known
 
 # --- Static config ---
 TIMEZONE      = '+08:00'
@@ -36,7 +31,7 @@ PERSON_CODE   = ''
 TEMPERATURE_STATUS = -1
 MASK_STATUS   = -1
 SORT_FIELD    = 'SwipeTime'
-ORDER_TYPE    = 1
+ORDER_TYPE    = 0
 BATCH_SIZE    = 100
 LOG_DIR       = 'logs'  # staging sink for attendance records before send (temp until DB)
 EVENT_TEST    = os.environ.get('EVENT_TEST', '')
@@ -46,6 +41,8 @@ WINDOW_MINUTES   = 30  # fetch window size
 MAX_WINDOW_RETRIES = 10  # retries (one per scheduler tick) before giving up on a failed window
 MIN_GAP_MINUTES  = 5   # suppress duplicate events for the same person within this window
 FOREIGN_WORKER   = os.environ.get('FOREIGN_WORKER', '').lower() == 'true'
+DRY_RUN          = False  # set via --dry-run; skips Rymnet send + DB/checkpoint writes
+ONLY_EMPLOYEE_NO = None   # set via --employee-no; restrict processing to this employee_no
 
 
 def _fmt(dt: datetime) -> str:
@@ -91,13 +88,15 @@ def _log_rejected(records: list, window: str) -> str:
     return path
 
 
-def _log_attendance(records: list):
+def _log_attendance(records: list, window_start: str):
     """Stage attendance records to LOG_DIR/attendance_<date>.jsonl before sending.
     Temporary sink (one JSON object per line) until a DB replaces it."""
     if not records:
         return
     os.makedirs(LOG_DIR, exist_ok=True)
-    path = os.path.join(LOG_DIR, f"attendance_{datetime.now():%Y%m%d}.jsonl")
+    suffix = f"_{ONLY_EMPLOYEE_NO}" if ONLY_EMPLOYEE_NO else ""
+    date = datetime.fromisoformat(window_start).strftime('%Y%m%d')
+    path = os.path.join(LOG_DIR, f"attendance_{date}{suffix}.jsonl")
     with open(path, 'a', encoding='utf-8') as f:
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + '\n')
@@ -116,6 +115,9 @@ def _send_resilient(records: list, pages: list, signature: dict, window: str, id
     """
     ids = ids if ids is not None else [None] * len(records)
     label = f"pages {pages} ({len(records)} records)"
+    if DRY_RUN:
+        logger.info(f"[DRY RUN] Would send {label}")
+        return False, len(records)
     ok, _ = _send_with_retry(records, f"Batch {label}")
     if ok:
         db.set_status(ids, db.STATUS_SUCCESS)
@@ -219,6 +221,9 @@ def _prepare_page(events: list, person_cache: dict, seen: set, last_sent: dict) 
     if FOREIGN_WORKER:
         audited = [rec for rec in audited if rec.get('employee_no', '').startswith('FW-')]
         deduped = [rec for rec in deduped if rec.get('employee_no', '').startswith('FW-')]
+    if ONLY_EMPLOYEE_NO:
+        audited = [rec for rec in audited if rec.get('employee_no', '') == ONLY_EMPLOYEE_NO]
+        deduped = [rec for rec in deduped if rec.get('employee_no', '') == ONLY_EMPLOYEE_NO]
     return audited, deduped, dupes
 
 
@@ -228,11 +233,11 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
     Returns (ok, records_sent). ok is False if the window did not complete.
     Holds the cross-process send lock so no other process sends concurrently."""
     cycle_start = time.perf_counter()
-    logger.info(f"=== Window {start} → {end} ===")
+    logger.info(f"=== Window {start} → {end} ==={' [DRY RUN]' if DRY_RUN else ''}")
 
     signature = checkpoint.query_signature(start, end, DOORS, EVENT_TYPE)
 
-    if reset:
+    if reset and not DRY_RUN:
         checkpoint.clear_window(signature)
         logger.info("Window state cleared — starting fresh")
 
@@ -243,7 +248,8 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
         stop, _ = _send_resilient(pending['records'], pending['pages'], signature, f"{start} → {end}", pending.get('ids'))
         if stop:
             return False, 0
-        checkpoint.clear_pending(signature)
+        if not DRY_RUN:
+            checkpoint.clear_pending(signature)
 
     # 2. Hik resume: continue from last fully-sent page.
     resume_page = checkpoint.load_checkpoint(signature) + 1
@@ -287,17 +293,20 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
         ):
             audited, deduped, page_dupes = _prepare_page(events, person_cache, seen, last_sent)
             dupes += page_dupes
-            _log_attendance(audited)
-            try:
-                record_ids = db.insert_records(audited)
-                failed = sum(1 for r in record_ids if r is None)
-                if failed:
-                    logger.error(f"DB insert: {failed}/{len(record_ids)} record(s) failed on page {page_no}")
-                else:
-                    logger.info(f"DB insert: {len(record_ids)} record(s) inserted on page {page_no}")
-            except Exception as e:
-                logger.error(f"DB insert_records call failed: {e}")
+            _log_attendance(audited, start)
+            if DRY_RUN:
                 record_ids = [None] * len(audited)
+            else:
+                try:
+                    record_ids = db.insert_records(audited)
+                    failed = sum(1 for r in record_ids if r is None)
+                    if failed:
+                        logger.error(f"DB insert: {failed}/{len(record_ids)} record(s) failed on page {page_no}")
+                    else:
+                        logger.info(f"DB insert: {len(record_ids)} record(s) inserted on page {page_no}")
+                except Exception as e:
+                    logger.error(f"DB insert_records call failed: {e}")
+                    record_ids = [None] * len(audited)
             deduped_ids = [rid for rid, rec in zip(record_ids, audited) if not rec['duplicate']]
             if batch and len(batch) + len(deduped) > BATCH_SIZE:
                 if not flush():
@@ -319,13 +328,15 @@ def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
     if not flush():
         return False, 0
 
-    checkpoint.clear_window(signature)  # completed — no longer needs to rerun
+    if not DRY_RUN:
+        checkpoint.clear_window(signature)  # completed — no longer needs to rerun
     elapsed = time.perf_counter() - cycle_start
-    logger.info(f"=== Window done — {total} records sent, {dupes} duplicates skipped in {elapsed:.2f}s ===")
-    notify(
-        f"[HIK SYNC] Window done: {start} → {end}\n"
-        f"{total} records sent, {dupes} duplicates skipped, {elapsed:.2f}s"
-    )
+    logger.info(f"=== Window done{' [DRY RUN]' if DRY_RUN else ''} — {total} records sent, {dupes} duplicates skipped in {elapsed:.2f}s ===")
+    if not DRY_RUN:
+        notify(
+            f"[HIK SYNC] Window done: {start} → {end}\n"
+            f"{total} records sent, {dupes} duplicates skipped, {elapsed:.2f}s"
+        )
     return True, total
 
 
@@ -440,7 +451,30 @@ if __name__ == '__main__':
                         help="Test mode: window start, e.g. 2026-04-01T08:00:00")
     parser.add_argument('--end', metavar='DATETIME',
                         help="Test mode: window end,   e.g. 2026-04-01T08:30:00")
+    parser.add_argument('--output-dir', metavar='DIR', default='logs',
+                        help="Directory for attendance.log (default: logs)")
+    parser.add_argument('--dry-run', action='store_true',
+                        help="Fetch/process events but don't send to Rymnet or write DB/checkpoint state")
+    parser.add_argument('--employee-no', metavar='EMPLOYEE_NO',
+                        help="Only log/send records for this employee_no (verified against Rymnet first)")
     args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    attendance_handler = logging.FileHandler(os.path.join(args.output_dir, 'attendance.log'), encoding='utf-8')
+    attendance_handler.setLevel(logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[attendance_handler, error_handler],
+    )
+    DRY_RUN = args.dry_run
+
+    if args.employee_no:
+        if not employee_exists(args.employee_no):
+            logger.error(f"employee_no {args.employee_no} not found in Rymnet — aborting")
+            raise SystemExit(1)
+        logger.info(f"employee_no {args.employee_no} confirmed — restricting to this employee")
+        ONLY_EMPLOYEE_NO = args.employee_no
 
     if args.clear_windows:
         checkpoint.clear_windows()
