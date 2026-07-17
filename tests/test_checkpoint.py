@@ -3,6 +3,7 @@ fetch_person_info are stubbed. State dir is redirected to a temp folder.
 
 Run:  python -m unittest test_checkpoint -v
 """
+import contextlib
 import glob
 import json
 import os
@@ -12,6 +13,7 @@ import unittest
 import checkpoint
 import db
 import main
+import sendlock
 
 START = '2026-04-01T00:00:00+08:00'
 END   = '2026-04-01T00:30:00+08:00'
@@ -82,12 +84,16 @@ class StateTestBase(unittest.TestCase):
         self._orig_logdir = main.LOG_DIR
         self._orig_db_ins = main.db.insert_records
         self._orig_db_set = main.db.set_status
+        self._orig_fw     = main.FOREIGN_WORKER
+        self._orig_lock   = sendlock.send_lock
         main.fetch_person_info = lambda pid: {'personCode': f'E_{pid}'}
         main.SEND_RETRY_DELAY = 0
         main.notify = lambda *a, **k: None   # never hit real Lark in tests
         main.LOG_DIR = os.path.join(self._tmp.name, 'logs')  # don't touch real logs/
         main.db.insert_records = lambda recs: [None] * len(recs)   # never hit real DB
         main.db.set_status = lambda ids, status: None
+        main.FOREIGN_WORKER = False   # don't roster-filter (would fetch Rymnet + drop fakes)
+        sendlock.send_lock = lambda: contextlib.nullcontext()  # no real cross-process lock
         self.sig = checkpoint.query_signature(START, END, main.DOORS, main.EVENT_TYPE)
 
     def tearDown(self):
@@ -100,6 +106,8 @@ class StateTestBase(unittest.TestCase):
         main.LOG_DIR       = self._orig_logdir
         main.db.insert_records = self._orig_db_ins
         main.db.set_status     = self._orig_db_set
+        main.FOREIGN_WORKER    = self._orig_fw
+        sendlock.send_lock     = self._orig_lock
         self._tmp.cleanup()
 
     def run_window(self, reset=False):

@@ -24,6 +24,21 @@ def employee_exists(employee_no: str) -> bool:
     return bool(data.get('employee'))
 
 
+def fetch_fw_roster() -> set:
+    """Return the employee_no of every Rymnet employee with category_code=FW."""
+    params = {
+        'access_token': TOKEN,
+        'format': 'Json',
+        'filters': json.dumps({'category_code': 'FW'}),
+    }
+    res = requests.get(URL, params=params)
+    res.raise_for_status()
+    data = res.json()
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    return {e['employee_no'] for e in data.get('employee', [])}
+
+
 if __name__ == '__main__':
     import sys
     emp = sys.argv[1] if len(sys.argv) > 1 else 'RC14405'

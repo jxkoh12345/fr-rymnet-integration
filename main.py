@@ -3,13 +3,15 @@ import getpass
 import logging
 import json
 import os
+import re
 import time
 from datetime import datetime, timedelta
 from signature.door_events import iter_pages
 from signature.personId import fetch_person_info
 from signature.final_data import send, build_body
-from signature.rymnet_employee import employee_exists
+from signature.rymnet_employee import employee_exists, fetch_fw_roster
 from DoorList import DoorList
+from ExcludeList import EXCLUDE_EMPLOYEES
 import checkpoint
 import db
 import sendlock
@@ -39,10 +41,11 @@ SEND_RETRIES  = 3
 SEND_RETRY_DELAY = 2   # seconds between send retries
 WINDOW_MINUTES   = 30  # fetch window size
 MAX_WINDOW_RETRIES = 10  # retries (one per scheduler tick) before giving up on a failed window
-MIN_GAP_MINUTES  = 5   # suppress duplicate events for the same person within this window
+MIN_GAP_MINUTES  = 1   # suppress duplicate events for the same person within this window
 FOREIGN_WORKER   = os.environ.get('FOREIGN_WORKER', '').lower() == 'true'
 DRY_RUN          = False  # set via --dry-run; skips Rymnet send + DB/checkpoint writes
 ONLY_EMPLOYEE_NO = None   # set via --employee-no; restrict processing to this employee_no
+_fw_roster_cache = None   # lazily populated by _get_fw_roster()
 
 
 def _fmt(dt: datetime) -> str:
@@ -176,12 +179,28 @@ def _resolve_record(item: dict, person_cache: dict) -> dict:
     )
 
 
+def _device_id(location: str, indicator: str) -> str:
+    """Strip the IN/OUT direction word from a door name to get the physical
+    device (e.g. 'WHGF TURN IN 1' and 'WHGF TURN OUT 1' -> 'WHGF TURN 1'),
+    since the same turnstile can register a bounce on either reader."""
+    device = re.sub(rf'\b{re.escape(indicator)}\b', '', location) if indicator else location
+    return ' '.join(device.split())
+
+
+def _get_fw_roster() -> set:
+    """Rymnet's employee_no set for category_code=FW, fetched once per process."""
+    global _fw_roster_cache
+    if _fw_roster_cache is None:
+        _fw_roster_cache = fetch_fw_roster()
+    return _fw_roster_cache
+
+
 def _prepare_page(events: list, person_cache: dict, seen: set, last_sent: dict) -> tuple[list, list, int]:
     """Resolve a page of events into request bodies, normalize FW prefixes and
     mark duplicates. Returns (audited, deduped, dupes):
       audited — every record tagged with 'duplicate' (audit trail)
       deduped — the records to actually send
-    Honors FOREIGN_WORKER by filtering both lists."""
+    Honors FOREIGN_WORKER by filtering both lists against Rymnet's category_code=FW roster."""
     bodies = [_resolve_record(e, person_cache) for e in events]
     for record in bodies:
         if record.get('employee_no', '').startswith('FW'):
@@ -194,15 +213,17 @@ def _prepare_page(events: list, person_cache: dict, seen: set, last_sent: dict) 
         emp = record.get('employee_no', '')
         logtime_str = record.get('logtime', '')
         indicator = record.get('indicator', '')
+        location = record.get('location', '')
+        device = _device_id(location, indicator)
         is_dup = False
         if emp:
-            key = (emp, indicator)
+            key = (emp, device)
             try:
                 t = datetime.strptime(logtime_str, '%Y-%m-%d %H:%M:%S')
                 if key in last_sent and abs((t - last_sent[key]).total_seconds()) < MIN_GAP_MINUTES * 60:
                     dupes += 1
                     is_dup = True
-                    logger.debug(f"Duplicate skipped (<{MIN_GAP_MINUTES}min gap): employee_no={emp} indicator={indicator} logtime={logtime_str}")
+                    logger.debug(f"Duplicate skipped (<{MIN_GAP_MINUTES}min gap): employee_no={emp} device={device} logtime={logtime_str}")
                 else:
                     last_sent[key] = t
             except ValueError:
@@ -219,19 +240,29 @@ def _prepare_page(events: list, person_cache: dict, seen: set, last_sent: dict) 
         if not is_dup:
             deduped.append(record)
     if FOREIGN_WORKER:
-        audited = [rec for rec in audited if rec.get('employee_no', '').startswith('FW-')]
-        deduped = [rec for rec in deduped if rec.get('employee_no', '').startswith('FW-')]
+        fw_roster = _get_fw_roster()
+        audited = [rec for rec in audited if rec.get('employee_no', '') in fw_roster]
+        deduped = [rec for rec in deduped if rec.get('employee_no', '') in fw_roster]
     if ONLY_EMPLOYEE_NO:
         audited = [rec for rec in audited if rec.get('employee_no', '') == ONLY_EMPLOYEE_NO]
         deduped = [rec for rec in deduped if rec.get('employee_no', '') == ONLY_EMPLOYEE_NO]
+    deduped = [rec for rec in deduped if rec.get('employee_no', '') not in EXCLUDE_EMPLOYEES]
     return audited, deduped, dupes
 
 
-@sendlock.locked
 def run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
     """Fetch events in [start, end] and send to Rymnet, with checkpointing.
     Returns (ok, records_sent). ok is False if the window did not complete.
-    Holds the cross-process send lock so no other process sends concurrently."""
+    Holds the cross-process send lock so no other process sends concurrently.
+    Skipped entirely in --dry-run, since nothing is sent — dry runs can run
+    alongside the live scheduler without waiting on it."""
+    if DRY_RUN:
+        return _run_window(start, end, reset)
+    with sendlock.send_lock():
+        return _run_window(start, end, reset)
+
+
+def _run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
     cycle_start = time.perf_counter()
     logger.info(f"=== Window {start} → {end} ==={' [DRY RUN]' if DRY_RUN else ''}")
 

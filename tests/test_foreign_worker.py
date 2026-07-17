@@ -10,6 +10,11 @@ os.environ.setdefault('RYMNET_TOKEN', 'test')
 from unittest.mock import patch
 import main
 
+# Fake Rymnet category_code=FW roster covering this file's test employee_no's.
+# Includes 'RC10161' (no "FW" prefix) to mirror real Rymnet data where most
+# FW-category employees don't have an "FW" prefix at all.
+TEST_FW_ROSTER = {'FW-A00304480', 'FW-B00100001', 'FW-BT0490848', 'FW-', 'RC10161'}
+
 
 def _run(events, foreign_worker: bool):
     sent = []
@@ -25,6 +30,7 @@ def _run(events, foreign_worker: bool):
          patch('main._log_attendance'), \
          patch.object(main.db, 'insert_records', lambda recs: [None] * len(recs)), \
          patch.object(main.db, 'set_status', lambda *a, **k: None), \
+         patch('main._get_fw_roster', return_value=TEST_FW_ROSTER), \
          patch.object(main, 'FOREIGN_WORKER', foreign_worker):
         main.run_window('2026-01-01T08:00:00+08:00', '2026-01-01T08:30:00+08:00')
     return sent
@@ -103,6 +109,13 @@ def test_on_fw_lowercase_filtered():
 def test_on_all_non_fw_zero_sent():
     sent = _run([r('RC3645'), r('E001'), r('A999')], foreign_worker=True)
     assert len(sent) == 0
+
+
+def test_on_fw_category_without_prefix_sent():
+    # Rymnet category_code=FW but employee_no has no "FW" prefix (the common case)
+    sent = _run([r('RC10161')], foreign_worker=True)
+    assert len(sent) == 1
+    assert sent[0]['employee_no'] == 'RC10161'
 
 
 def test_on_fw_prefix_only_boundary():

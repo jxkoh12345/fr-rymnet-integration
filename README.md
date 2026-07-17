@@ -54,7 +54,8 @@ Hikvision door/events API              (signature/door_events.iter_pages)
    • eventTime → "YYYY-MM-DD HH:MM:SS"
    • FW… → FW-… prefix normalization
    • mark duplicates (<5 min gap same person)
-   • optional FOREIGN_WORKER filter
+   • optional FOREIGN_WORKER filter (Rymnet category_code=FW roster, cached per process)
+   • EXCLUDE_EMPLOYEES (ExcludeList.py) always dropped from send, still audited
         │
         ├─► hik_records  (ALL records, incl. duplicates — audit)   (db.insert_records)
         │
@@ -170,6 +171,7 @@ uv sync                          # create .venv and install deps
 ```bash
 uv run main.py                   # continuous scheduler, resume from saved state
 uv run main.py --reset           # wipe ALL state, then run (scheduler mode only)
+uv run main.py --output-dir DIR  # write attendance.log under DIR instead of logs/ (default: logs)
 ```
 
 ### Manual window — fetch + send to Rymnet
@@ -183,6 +185,13 @@ uv run main.py --start 2026-06-26T00:00:00 --end 2026-07-03T00:00:00
 
 Timezone (`+08:00`) is auto-appended if omitted. Resumes from the window's
 checkpoint if interrupted.
+
+Extra flags, combinable with `--start/--end`:
+
+```bash
+uv run main.py --start ... --end ... --dry-run                # fetch/process only, no Rymnet send, no DB/checkpoint writes
+uv run main.py --start ... --end ... --employee-no RC12345    # restrict to one employee_no (verified against Rymnet first, aborts if not found)
+```
 
 ### Backfill `hik_records` only — NO send
 
@@ -256,6 +265,22 @@ uv run find_username.py -t 2026-06-22T08:00:00 2026-06-22T09:00:00 -u john
 Each run overwrites `find_results.log` with full JSON; each event carries a
 `_resolved` field (personCode/personName). Terminal prints a one-line summary.
 
+### Convert attendance log to Excel (`jsonl_to_xlsx.py`)
+
+```bash
+uv run jsonl_to_xlsx.py logs/attendance_20260708.jsonl               # -> logs/attendance_20260708.xlsx
+uv run jsonl_to_xlsx.py logs/attendance_20260708.jsonl -o out.xlsx   # explicit output path
+```
+
+### Dump the Hikvision door list to CSV (`signature/generate.py`)
+
+```bash
+uv run signature/generate.py     # -> acs_doors.csv (all pages of acsDoorList)
+```
+
+One-off util for building/refreshing `DoorList.py` — app_key/secret and host are
+hardcoded in the file, not read from `.env`.
+
 ### Smoke-test Lark
 
 ```bash
@@ -321,6 +346,7 @@ HIK_PERSON_PATH=/artemis/api/resource/v1/person/personId/personInfo
 
 # Rymnet
 RYMNET_URL=https://api.rymnet.com/public/attendance/set
+RYMNET_EMPLOYEE_URL=https://api.rymnet.com/public/employee/biodata
 RYMNET_TOKEN=...
 
 # Postgres (attendance DB) — leave blank to disable the DB sink entirely
@@ -330,7 +356,7 @@ PG_DATABASE=hik_rymnet
 PG_USER=postgres
 PG_PASSWORD=...
 
-# Filter: true = only send records whose employee_no starts with "FW"
+# Filter: true = only send records whose employee_no is in Rymnet's category_code=FW roster
 FOREIGN_WORKER=false
 
 # Optional: notify to Lark when this employee_no is seen (debugging)
@@ -364,17 +390,20 @@ hik/
 ├── sendlock.py             # cross-process Rymnet send lock (fcntl / msvcrt)
 ├── notifier.py             # Lark (Feishu) notifications
 ├── DoorList.py             # door metadata (id → type/name/indicator)
+├── ExcludeList.py          # employee_no set always dropped from Rymnet send (still audited)
 ├── fill_records.py         # backfill hik_records for a window (no send, no state)
 ├── fill_records_test.py    # same, into scratch table hik_records_test
 ├── debug_pending.py        # isolate which pending record(s) Rymnet rejects
 ├── list_windows.py         # print state/windows/ files: range / page / pending
 ├── find_username.py        # CLI: query raw Hikvision events by time / employee
+├── jsonl_to_xlsx.py        # convert an attendance .jsonl log to .xlsx
 ├── schema.sql              # incremental migration (status column + index)
 ├── signature/
 │   ├── auth.py             # Hikvision HMAC request signing
 │   ├── door_events.py      # door-event fetch (paged / resumable)
 │   ├── personId.py         # person info lookup
 │   ├── final_data.py       # Rymnet record builder + sender + rate limiter
+│   ├── rymnet_employee.py  # employee_exists (--employee-no check), fetch_fw_roster (FOREIGN_WORKER filter)
 │   └── generate.py         # standalone util: dump door list to CSV
 ├── tests/                  # pytest suite (network stubbed)
 ├── .env                    # secrets / endpoints (gitignored)
@@ -400,7 +429,8 @@ hik/
 | `recover_windows() -> int` | Re-run orphan windows (files present, not in failed queue). |
 | `scheduler(reset=False)` | Infinite loop: sleep to boundary → retry failed → process window → midnight summary. |
 
-**CLI:** `--reset`, `--clear-windows`, `--recover-windows`, `--start/--end`.
+**CLI:** `--reset`, `--clear-windows`, `--recover-windows`, `--start/--end`,
+`--output-dir`, `--dry-run`, `--employee-no`.
 
 ### `db.py`
 
