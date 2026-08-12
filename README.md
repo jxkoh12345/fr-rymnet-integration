@@ -1,11 +1,24 @@
 # HIK → Rymnet Attendance Sync
 
-Continuously pulls door-access events from a Hikvision (Artemis) access-control
-API, resolves each person's employee code, records everything to Postgres, and
-pushes attendance records to the Rymnet attendance API. Runs as a continuous
-30-minute-window scheduler with per-window checkpointing, automatic retries,
-per-record poison isolation, cross-process send locking, Rymnet rate limiting,
-and Lark (Feishu) notifications.
+Continuously pulls door-access events from Hikvision, resolves each person's
+employee code, records everything to Postgres, and pushes attendance records to
+the Rymnet attendance API. Runs as a continuous scheduler with checkpointing,
+automatic retries, per-record poison isolation, cross-process send locking,
+Rymnet rate limiting, and Lark (Feishu) notifications.
+
+Events arrive over **two independent paths**:
+
+| Path | Source | Indexed by | Doors |
+|------|--------|-----------|-------|
+| **Artemis** | central server's `door/events` API | 30-minute time windows | every `type=='Door'` in `DoorList` |
+| **Device** | the FR terminals themselves, over ISAPI | each device's own `serialNo` counter | every entry in `DeviceList` |
+
+The device path exists because the Artemis path cannot detect its own data loss:
+if a device uploads late, the window that would have carried the event has
+already closed, and a missing event is indistinguishable from a quiet period.
+Reading the terminal directly removes the upload hop, and its gap-free event
+counter makes missing data arithmetic rather than guesswork. See
+[Device path](#device-path-direct-from-the-fr-terminals).
 
 ---
 
@@ -13,6 +26,7 @@ and Lark (Feishu) notifications.
 
 - [How it works](#how-it-works)
 - [Data flow](#data-flow)
+- [Device path](#device-path-direct-from-the-fr-terminals)
 - [Database](#database)
 - [Reliability model](#reliability-model)
 - [Commands](#commands)
@@ -44,32 +58,175 @@ page checkpoint, so a crash or outage never re-sends already-delivered records.
 
 ## Data flow
 
+```mermaid
+flowchart TD
+    TICK["Scheduler tick at :00/:30<br/>main.scheduler"] --> RETRY["Retry failed windows<br/>state/failed.json"]
+    RETRY --> WIN["run_window(start, end)<br/>holds cross-process send lock"]
+
+    WIN --> PEND{"Pending batch<br/>from last run?"}
+    PEND -- yes --> SEND
+    PEND -- no --> CKPT["Resume from page checkpoint<br/>state/windows/&lt;sig&gt;.json"]
+
+    CKPT --> HIK["Hikvision (Artemis) door/events API<br/>signature/door_events.iter_pages<br/>HMAC-signed, 50 records/page"]
+
+    HIK -->|page of raw events| RES["Resolve + normalize<br/>_prepare_page / _resolve_record"]
+
+    subgraph R["Per-record resolution"]
+        direction TB
+        R1["personId → personCode<br/>signature/personId, cached"]
+        R2["doorIndexCode → name / indicator<br/>DoorList"]
+        R3["eventTime → 'YYYY-MM-DD HH:MM:SS'"]
+        R4["FW… → FW-… prefix normalize"]
+        R5["Mark duplicates<br/>&lt;5 min gap, same person"]
+        R6["FOREIGN_WORKER filter<br/>Rymnet category_code=FW roster"]
+        R7["ExcludeList drops from send<br/>still audited"]
+        R1 --> R2 --> R3 --> R4 --> R5 --> R6 --> R7
+    end
+
+    RES --> R
+    R --> AUDIT["ALL records incl. duplicates"]
+    R --> CLEAN["Non-duplicate records only"]
+
+    AUDIT --> PG1[("hik_records<br/>db.insert_records<br/>full audit trail")]
+    PG1 -->|record UUIDs| CLEAN
+
+    CLEAN --> BATCH["Page-aligned batches ≤100<br/>BATCH_SIZE"]
+    BATCH --> SEND["_send_with_retry<br/>3 attempts, 2s backoff"]
+
+    SEND --> RYM["Rymnet attendance API<br/>signature/final_data.send<br/>throttled 10 calls/60s<br/>serialized by sendlock"]
+
+    RYM -->|2xx| OK["Advance page checkpoint"]
+    RYM -->|batch failed| ISO["_send_resilient<br/>re-send each record alone"]
+
+    ISO -->|record OK| OK
+    ISO -->|record rejected| BAD["Poison record<br/>logged to errors/, dropped"]
+    ISO -->|nothing sends| STUCK["Save pending batch<br/>window stops, re-queued to failed.json"]
+
+    OK --> S1[("hik_record_status<br/>SUCCESS")]
+    BAD --> S2[("hik_record_status<br/>FAILED")]
+    STUCK --> S3[("hik_record_status<br/>PENDING")]
+
+    OK --> DONE["Window complete<br/>state file deleted"]
+    DONE --> LARK["Lark notification<br/>notifier.notify"]
+    STUCK --> GIVEUP{"attempts ><br/>MAX_WINDOW_RETRIES?"}
+    GIVEUP -- yes --> ALERT["Drop window, mark FAILED,<br/>Lark alert for manual fix"]
+    GIVEUP -- no --> TICK
 ```
-Hikvision door/events API              (signature/door_events.iter_pages)
-        │  pages of raw events (50/page)
-        ▼
-  resolve + normalize                  (main._prepare_page → _resolve_record)
-   • personId → personCode             (signature/personId.fetch_person_info, cached)
-   • doorIndexCode → name/indicator    (DoorList)
-   • eventTime → "YYYY-MM-DD HH:MM:SS"
-   • FW… → FW-… prefix normalization
-   • mark duplicates (<5 min gap same person)
-   • optional FOREIGN_WORKER filter (Rymnet category_code=FW roster, cached per process)
-   • EXCLUDE_EMPLOYEES (ExcludeList.py) always dropped from send, still audited
-        │
-        ├─► hik_records  (ALL records, incl. duplicates — audit)   (db.insert_records)
-        │
-        ▼  non-duplicate records only
-  page-aligned batches (≤100)
-        │
-        ▼
-   Rymnet attendance API               (signature/final_data.send)
-   • rate-limited: 10 calls / 60s      (final_data._throttle)
-   • serialized across processes        (sendlock.send_lock)
-        │
-        ▼
-  hik_record_status  ← SUCCESS / PENDING / FAILED per record  (db.set_status)
+
+## Device path (direct from the FR terminals)
+
+Two doors are served this way — `DeviceList.py` maps device IP → door metadata,
+and those doors are **commented out of `DoorList`** so the Artemis path no longer
+fetches them:
+
+```python
+'10.1.72.122': {"doorIndexCode": 4729, "type": "Door", "doorName": "WHCJ IN - FR",  "indicator": "IN"},
+'10.1.72.119': {"doorIndexCode": 4741, "type": "Door", "doorName": "WHCJ OUT - FR", "indicator": "OUT"},
 ```
+
+Both mappings were confirmed by parity: the device's own log and the Artemis API
+returned identical `(employee_no, timestamp)` sets — 1457 events over 3 days,
+zero one-sided.
+
+### Why serials instead of time windows
+
+Every device event carries a monotonic counter (`serialNo`) shared by all event
+types, with no skipped values. A fetch therefore asks for a span of numbered
+slots and can *prove* completeness:
+
+```
+width = end - begin + 1          slots asked for
+totalMatches == width            the device's log has no holes
+len(events)  == totalMatches     paging retrieved everything offered
+```
+
+Both checks are enforced in `device_events.fetch_range`. Consequences:
+
+- **Nothing is silently missed.** A hole is a number, not an inference.
+- **Downtime self-heals.** A poller offline for hours just asks for a wider span.
+- **Any span is replayable**, exactly, for as long as the device retains it
+  (observed: back to 2025-12-17 on `10.1.72.122`).
+
+The query must be **unfiltered** (`major:0, minor:0`) because the completeness
+check needs the dense counter; `major 5 / minor 75` (successful authentication —
+the only event carrying `employeeNoString`) is filtered in-process afterwards.
+
+### Cycle
+
+```mermaid
+flowchart TD
+    POLL["run_device_cycle(host)<br/>every DEVICE_POLL_SECONDS"] --> PEND{"Pending batch<br/>from last cycle?"}
+    PEND -- yes --> SEND
+    PEND -- no --> NEW["newest_serial(host)"]
+    NEW --> RESET{"newest < cursor?"}
+    RESET -- yes --> ALERT["Device log was wiped<br/>cursor untouched, Lark alert"]
+    RESET -- no --> SAME{"newest == cursor?"}
+    SAME -- yes --> IDLE["Nothing new"]
+    SAME -- no --> FETCH["fetch_range(cursor+1, newest)<br/>unfiltered, paged 30"]
+    FETCH --> CHK{"len == totalMatches<br/>totalMatches == width?"}
+    CHK -- no --> GAP["errors/device_gap_*.json<br/>Lark alert, salvage survivors"]
+    CHK -- yes --> AUTH
+    GAP --> AUTH["auth_events: major 5 / minor 75"]
+    AUTH --> RES["_resolve_device_record<br/>employeeNoString → employee_no<br/>DeviceList → location / indicator"]
+    RES --> PREP["_prepare_page(resolve=…)<br/>dedup, FW prefix, ExcludeList, FW roster"]
+    PREP --> DB[("hik_records")]
+    PREP --> SEND["batches ≤100 → _send_resilient<br/>same lock / retry / isolation as windows"]
+    SEND -->|ok| ADV["cursor = newest<br/>state/devices/&lt;ip&gt;.json"]
+    SEND -->|failed| KEEP["cursor unchanged<br/>span refetched next cycle"]
+```
+
+No Artemis person lookup: the device's `employeeNoString` **is** the Artemis
+`personCode` (verified against the personId API), so the whole
+`personId → personCode` round trip disappears.
+
+Everything after resolution is the existing machinery — dedup, `ExcludeList`,
+`FOREIGN_WORKER` roster, `hik_records`, batching, send lock, retries, poison
+isolation, `hik_record_status`.
+
+### State
+
+`state/devices/<ip>.json`:
+
+```json
+{ "device": "10.1.72.119", "cursor": 134609, "updated": "2026-08-12 16:44:02",
+  "last_sent": { "RC13501|WHCJ - FR": "2026-08-12 15:54:07" } }
+```
+
+- `cursor` — highest serial fully processed. Advances **only** after a successful
+  send, so a failed cycle refetches the same span.
+- `last_sent` — dedup memory carried across cycles. Device polls are short and
+  frequent, so without persisting it two events seconds apart either side of a
+  cycle boundary would both pass the `MIN_GAP_MINUTES` check. Aged against the
+  newest event seen, not the wall clock.
+
+### Behaviour on trouble
+
+| Condition | Detected by | Action |
+|-----------|-------------|--------|
+| Device log has holes | `totalMatches != width` | log `errors/device_gap_*.json`, Lark alert, **send survivors and advance** (log holes never heal) |
+| Paging lost rows | `len(events) != totalMatches` | `DeviceFetchError`, cycle aborts, cursor untouched, retried next poll |
+| Device log wiped (counter restarts at 1) | `newest < cursor` | Lark alert, cursor **untouched** — needs a manual `state/devices/` fix before that device syncs again |
+| Device unreachable / 401 storm | `DeviceFetchError` after 5 attempts | logged, other devices continue, retried next poll |
+| Rymnet rejects a batch | existing `_send_resilient` | pending saved against the device signature, retried first next cycle |
+| First ever run | `cursor is None` | cursor set to newest, **no backfill**, Lark note. To backfill, edit `state/devices/<ip>.json` |
+
+### Device quirks that shaped the code
+
+- **`maxResults` caps at 30.** Longer spans need paging.
+- **One `searchID` per result set.** A fresh ID per page makes the device answer
+  from a different cached search — observed silently truncating 1148 events to
+  41, with a matching (wrong) `totalMatches`.
+- **One `requests.Session` per device.** A fresh `HTTPDigestAuth` per request
+  re-challenges and the device starts returning `401` after ~8 rapid calls.
+- **Occasional empty HTTP 200 bodies.** Retried with backoff.
+- **`beginSerialNo` requires `endSerialNo`** — alone it's `400 badJsonContent`.
+  Serial-range queries need no time bounds at all.
+- **`alertStream` is not used as a data source.** It only pushes live events, has
+  no history to re-ask, and replays a device's offline backlog with whatever
+  clock the device had at the time (a capture showed serials `1…29` stamped
+  `2026-01-01`). `devices.py` is the raw listener kept for reference.
+
+---
 
 ## Database
 
@@ -140,6 +297,8 @@ Layered, each independent:
 | **Give-up** | after `MAX_WINDOW_RETRIES` ticks | window dropped from queue, stuck records marked `FAILED`, **Lark alert** for manual intervention |
 | **Rate limit** | `final_data._throttle` — sliding window, 10 calls / 60s | blocks (waits) instead of getting HTTP 429 |
 | **Cross-process lock** | `sendlock` — `fcntl` file lock on `state/rymnet_send.lock` | a second sender **blocks** until the first finishes; prevents scheduler + manual tool both sending at once |
+| **Device cursor** | `state/devices/<ip>.json`, advanced only after a successful send | the same serial span is refetched next poll — no window to miss |
+| **Device completeness** | `totalMatches == width` and `len == totalMatches` in `fetch_range` | gap logged + alerted (survivors sent) / cycle aborted, cursor kept |
 
 A window's state file is **deleted on full success**, so `state/windows/` stays
 small. On every successful window the scheduler also sends a Lark "window done"
@@ -148,7 +307,14 @@ notification.
 **Known gaps (not handled):**
 - **Missed windows during downtime** — `_next_window()` is forward-only; windows
   missed while the host is down are not auto-caught-up (use a manual `--start/--end`
-  backfill).
+  backfill). Applies to the **Artemis path only** — the device path resumes from
+  its cursor automatically.
+- **Late uploads on the Artemis path** — a device that uploads after its window
+  closed is lost silently, and nothing records that it happened. This is the
+  failure the device path exists to remove; doors still on Artemis keep it.
+- **Device retention is the only backstop** — a device offline long enough for its
+  event log to wrap loses that data outright; there is no upstream copy. Depth is
+  generous (~8 months observed), so the cursor-lag alert is the practical guard.
 - **In-memory daily total** — a crash mid-day resets the running tally, so the
   midnight summary undercounts after a restart.
 - **Cross-process rate window** — the 10/min limiter is per-process; the send
@@ -172,6 +338,19 @@ uv sync                          # create .venv and install deps
 uv run main.py                   # continuous scheduler, resume from saved state
 uv run main.py --reset           # wipe ALL state, then run (scheduler mode only)
 uv run main.py --output-dir DIR  # write attendance.log under DIR instead of logs/ (default: logs)
+```
+
+The scheduler drives **both** paths: Artemis windows at each :00/:30 boundary,
+and a device poll every `DEVICE_POLL_SECONDS` (default 120) during the wait.
+
+### Device poll — one cycle per device, then exit
+
+Cursor-based, so it is safe to run at any time and at any frequency (cron,
+manual, or ad-hoc). Audits `modified_by` as the OS user.
+
+```bash
+uv run main.py --devices-once
+uv run main.py --devices-once --dry-run   # fetch/resolve only: no send, no DB, no cursor advance
 ```
 
 ### Manual window — fetch + send to Rymnet
@@ -253,6 +432,33 @@ uv run main.py --clear-windows   # delete all state/windows/ files, then exit
 rm -f state/failed.json          # clear the retry queue (separate)
 ```
 
+### Inspect a device's own event log (`ex_view.py`)
+
+Read-only viewer straight against the FR terminals — nothing is written to them.
+Useful for confirming what a device actually holds, independent of the pipeline.
+
+```bash
+uv run ex_view.py cursor                        # newest serial per device
+uv run ex_view.py tail                          # newest 20 auth events, both devices
+uv run ex_view.py tail 30 --host 10.1.72.119    # one device
+uv run ex_view.py day 2026-08-12                # every auth event that day, paged
+uv run ex_view.py serial 134500 134540 --all    # raw serial range + contiguity check
+```
+
+`--all` drops the `major 5 / minor 75` filter, exposing the full serial space
+(auth + door open/close + system events) — the view that makes gaps visible:
+
+```
+--- 10.1.72.119 WHCJ OUT - FR door=4741 serial 134500-134540: 41 fetched, device total 41
+    contiguity: width 41 vs total 41 -> dense, no holes
+  134500  2026-08-12T15:06:41  auth ok     FWBW0328767    IBRAHIM MD
+  134501  2026-08-12T15:06:42  door open   -
+  134502  2026-08-12T15:06:47  door close  -
+```
+
+`ex_device.py` is the lower-level probe (deviceInfo, time, raw `AcsEvent`
+searches, Artemis-vs-device parity). Both are experiment tools, not pipeline code.
+
 ### Query raw Hikvision events (`find_username.py`)
 
 ```bash
@@ -323,6 +529,35 @@ sudo systemctl start hik-sync
 3. `uv run debug_pending.py --send` → isolate: delivers the good records, drops
    the poison one(s) to `errors/`, and unsticks the window.
 
+### Backfill a device from an older serial
+
+The cursor is the only thing deciding where a device resumes, so a backfill is a
+state edit. Find the serial you want to start *after*:
+
+```bash
+uv run ex_view.py day 2026-08-10 --host 10.1.72.119   # locate the serial
+sudo systemctl stop hik-sync                          # avoid racing the scheduler
+# edit state/devices/10.1.72.119.json -> "cursor": <serial before the first one you want>
+uv run main.py --devices-once --dry-run               # confirm the span + record count
+uv run main.py --devices-once                         # send it
+sudo systemctl start hik-sync
+```
+
+Rymnet-side dedupe is the only guard against double-counting, so pick the serial
+deliberately.
+
+### A device reported a gap or a reset
+
+```bash
+cat errors/device_gap_*.json      # which serials are missing, and how many
+uv run ex_view.py cursor          # where each device is now
+```
+
+A **gap** is already handled: survivors were sent and the cursor advanced past it
+(device log holes never heal). A **reset** is not — the cursor was left untouched
+and that device stops syncing until you set `state/devices/<ip>.json` to a serial
+that exists on the wiped log (`uv run ex_view.py tail --host <ip>` to see them).
+
 ### HTTP 429 during a manual isolation run
 
 That's the Rymnet rate limit (10/min). The rate limiter now paces sends
@@ -337,6 +572,12 @@ the scheduler first.
 All secrets and endpoints live in `.env` (gitignored):
 
 ```ini
+# FR devices read directly over ISAPI (device path — see DeviceList.py)
+ISAPI_USERNAME=...
+ISAPI_PASSWORD=...
+# Device poll cadence in seconds, used inside the scheduler's sleep (default 120)
+DEVICE_POLL_SECONDS=120
+
 # Hikvision
 HIK_APP_KEY=...
 HIK_APP_SECRET=...
@@ -384,17 +625,22 @@ Tunable constants at the top of `main.py`: `BATCH_SIZE` (100), `SEND_RETRIES`
 
 ```
 hik/
-├── main.py                 # entry point: scheduler, window processing, CLI
+├── main.py                 # entry point: scheduler, window + device processing, CLI
 ├── db.py                   # Postgres sink: insert_records, set_status (best-effort)
 ├── checkpoint.py           # disk-backed per-window state + failed-window queue
+├── device_events.py        # device path: ISAPI serial-range fetch + cursor state
 ├── sendlock.py             # cross-process Rymnet send lock (fcntl / msvcrt)
 ├── notifier.py             # Lark (Feishu) notifications
-├── DoorList.py             # door metadata (id → type/name/indicator)
+├── DoorList.py             # door metadata (id → type/name/indicator); device doors commented out
+├── DeviceList.py           # FR terminals read directly: ip → doorIndexCode/name/indicator
 ├── ExcludeList.py          # employee_no set always dropped from Rymnet send (still audited)
 ├── fill_records.py         # backfill hik_records for a window (no send, no state)
 ├── fill_records_test.py    # same, into scratch table hik_records_test
 ├── debug_pending.py        # isolate which pending record(s) Rymnet rejects
 ├── list_windows.py         # print state/windows/ files: range / page / pending
+├── ex_view.py              # read-only viewer for a device's own event log (experiment tool)
+├── ex_device.py            # low-level device probe / Artemis-vs-device parity (experiment tool)
+├── devices.py              # raw alertStream listener, kept for reference (not a data source)
 ├── find_username.py        # CLI: query raw Hikvision events by time / employee
 ├── jsonl_to_xlsx.py        # convert an attendance .jsonl log to .xlsx
 ├── schema.sql              # incremental migration (status column + index)
@@ -408,8 +654,10 @@ hik/
 ├── tests/                  # pytest suite (network stubbed)
 ├── .env                    # secrets / endpoints (gitignored)
 ├── logs/                   # attendance_<date>.jsonl staging (gitignored)
-├── errors/                 # errors.log + rejected/bad records (gitignored)
+├── errors/                 # errors.log + rejected/bad records + device_gap_* (gitignored)
 └── state/                  # runtime checkpoints + send lock (gitignored)
+    ├── windows/            # per-window page/pending state (device pending included)
+    └── devices/            # per-device cursor + dedup memory
 ```
 
 ---
@@ -427,10 +675,28 @@ hik/
 | `_send_with_retry(records, label) -> (ok, secs)` | POST a batch, `SEND_RETRIES` attempts with backoff. |
 | `_retry_failed_windows() -> int` | Retry each `state/failed.json` window once; give up + alert after `MAX_WINDOW_RETRIES`. |
 | `recover_windows() -> int` | Re-run orphan windows (files present, not in failed queue). |
-| `scheduler(reset=False)` | Infinite loop: sleep to boundary → retry failed → process window → midnight summary. |
+| `run_device_cycle(host) -> (ok, sent)` | **Device path.** One poll of one FR terminal: pending retry → newest serial → reset check → `fetch_range(cursor+1, newest)` → filter → resolve → audit → DB → batch → send → advance cursor. Cursor only moves after a successful send. |
+| `run_devices() -> int` | One cycle per `DeviceList` entry, under the cross-process send lock. Per-device errors are isolated. |
+| `_resolve_device_record(item, info) -> dict` | Device event → Rymnet body. `employeeNoString` is already the `personCode`, so no person lookup. |
+| `_device_signature(host) -> dict` | Checkpoint identity for a device — keyed on the device, **not** the serial span, so a failed cycle's pending batch is still retried after the span moves. |
+| `_sleep_polling_devices(until) -> int` | Wait for the next window boundary, polling devices every `DEVICE_POLL_SECONDS` on the way. |
+| `_prepare_page(..., resolve=None)` | `resolve` overrides the event→body mapping; defaults to the Artemis resolver. |
+| `scheduler(reset=False)` | Infinite loop: poll devices while sleeping to the boundary → retry failed → process window → midnight summary. |
 
-**CLI:** `--reset`, `--clear-windows`, `--recover-windows`, `--start/--end`,
-`--output-dir`, `--dry-run`, `--employee-no`.
+**CLI:** `--reset`, `--clear-windows`, `--recover-windows`, `--devices-once`,
+`--start/--end`, `--output-dir`, `--dry-run`, `--employee-no`.
+
+### `device_events.py`
+
+| Function | Description |
+|----------|-------------|
+| `newest_serial(host) -> (serial, time)` | The device's latest event — the fetch upper bound. |
+| `fetch_range(host, begin, end) -> list` | Every event in an inclusive serial span, unfiltered and paged (30/page, one `searchID`). Raises `DeviceGapError` if the device's log is short, `DeviceFetchError` if paging retrieved less than offered. |
+| `auth_events(events) -> list` | `major 5 / minor 75` only, sorted by time (response order is not serial order). |
+| `load_state(host)` / `save_state(host, cursor, last_sent)` | `state/devices/<ip>.json`: cursor + cross-cycle dedup memory. Written atomically. |
+
+Exceptions: `DeviceFetchError`, `DeviceGapError` (carries the survivors),
+`DeviceResetError`.
 
 ### `db.py`
 
@@ -509,8 +775,11 @@ journalctl -u hik-sync -f            # live logs (stdout → journald)
 > or windows will be offset from the wall clock.
 >
 > **Stop the service before running manual send tools** (`--start/--end`,
-> `--recover-windows`, `debug_pending.py --send`). The send lock will make them
-> wait anyway, but stopping avoids contention on a long backfill.
+> `--recover-windows`, `--devices-once`, `debug_pending.py --send`). The send lock
+> will make them wait anyway, but stopping avoids contention on a long backfill.
+>
+> **The device path needs network reach to every `DeviceList` IP** on port 80 from
+> the host running the scheduler, plus `ISAPI_USERNAME` / `ISAPI_PASSWORD`.
 
 ---
 
@@ -529,4 +798,14 @@ Covers: page-aligned batching, send-failure → pending save, resume-after-crash
 pending-retry-first (no double-send), per-record isolation, window-retry
 recovery, give-up after `MAX_WINDOW_RETRIES`, dedup logic, foreign-worker
 filtering, DB status transitions, and the recover/pipeline paths.
+
+`tests/test_device_sync.py` covers the device path: dense-range fetch, device-log
+gap, short-paging truncation, multi-page walk, auth filtering/sorting,
+**device-resolved record == Artemis-resolved record for the same event**,
+first-run bootstrap without backfill, cursor advance, send failure leaving the
+cursor put, pending-retried-first, log-reset refusing to re-consume, gap logged
+then survivors sent, and dedup memory surviving across cycles.
+
+> Tests must stub `db.insert_records` / `db.set_status` (see the fixtures) — `.env`
+> is loaded at import, so an unstubbed test writes to the real Postgres.
 ```

@@ -11,9 +11,11 @@ from signature.personId import fetch_person_info
 from signature.final_data import send, build_body
 from signature.rymnet_employee import employee_exists, fetch_fw_roster
 from DoorList import DoorList
+from DeviceList import DeviceList
 from ExcludeList import EXCLUDE_EMPLOYEES
 import checkpoint
 import db
+import device_events
 import sendlock
 from notifier import notify
 
@@ -42,6 +44,8 @@ SEND_RETRY_DELAY = 2   # seconds between send retries
 WINDOW_MINUTES   = 30  # fetch window size
 MAX_WINDOW_RETRIES = 10  # retries (one per scheduler tick) before giving up on a failed window
 MIN_GAP_MINUTES  = 1   # suppress duplicate events for the same person within this window
+DEVICE_SIG_KEY   = 'device'  # marks a checkpoint signature as belonging to the device path
+DEVICE_POLL_SECONDS = int(os.environ.get('DEVICE_POLL_SECONDS', '120'))  # device poll cadence inside the scheduler's sleep
 FOREIGN_WORKER   = os.environ.get('FOREIGN_WORKER', '').lower() == 'true'
 DRY_RUN          = False  # set via --dry-run; skips Rymnet send + DB/checkpoint writes
 ONLY_EMPLOYEE_NO = None   # set via --employee-no; restrict processing to this employee_no
@@ -179,6 +183,18 @@ def _resolve_record(item: dict, person_cache: dict) -> dict:
     )
 
 
+def _resolve_device_record(item: dict, info: dict) -> dict:
+    """One raw device event → Rymnet body. No person lookup needed: the device's
+    employeeNoString is already the Artemis personCode (verified against the
+    personId API), so the whole personId→personCode round trip disappears."""
+    return build_body(
+        employee_no=item['employeeNoString'],
+        logtime=reformat_time(item['time']),
+        location=info['doorName'],
+        indicator=info.get('indicator') or '',
+    )
+
+
 def _device_id(location: str, indicator: str) -> str:
     """Strip the IN/OUT direction word from a door name to get the physical
     device (e.g. 'WHGF TURN IN 1' and 'WHGF TURN OUT 1' -> 'WHGF TURN 1'),
@@ -195,13 +211,16 @@ def _get_fw_roster() -> set:
     return _fw_roster_cache
 
 
-def _prepare_page(events: list, person_cache: dict, seen: set, last_sent: dict) -> tuple[list, list, int]:
+def _prepare_page(events: list, person_cache: dict, seen: set, last_sent: dict, resolve=None) -> tuple[list, list, int]:
     """Resolve a page of events into request bodies, normalize FW prefixes and
     mark duplicates. Returns (audited, deduped, dupes):
       audited — every record tagged with 'duplicate' (audit trail)
       deduped — the records to actually send
-    Honors FOREIGN_WORKER by filtering both lists against Rymnet's category_code=FW roster."""
-    bodies = [_resolve_record(e, person_cache) for e in events]
+    Honors FOREIGN_WORKER by filtering both lists against Rymnet's category_code=FW roster.
+    `resolve` overrides the event→body mapping (the device path passes its own);
+    it defaults to the Artemis resolver."""
+    resolve = resolve or _resolve_record
+    bodies = [resolve(e, person_cache) for e in events]
     for record in bodies:
         if record.get('employee_no', '').startswith('FW'):
             record['employee_no'] = 'FW-' + record['employee_no'][2:]
@@ -371,6 +390,170 @@ def _run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
     return True, total
 
 
+def _device_signature(host: str) -> dict:
+    """Checkpoint identity for a device. Deliberately keyed on the device alone,
+    not the serial span: the cursor is the real checkpoint, and a span-based
+    signature would orphan a failed cycle's pending batch as soon as the span
+    moved (the next cycle would never retry it)."""
+    return checkpoint.query_signature(DEVICE_SIG_KEY, host, [host], EVENT_TYPE)
+
+
+def _load_last_sent(raw: dict) -> dict:
+    """'<employee_no>|<device>' → datetime, for the cross-cycle dedup memory."""
+    out = {}
+    for key, iso in (raw or {}).items():
+        emp, _, device = key.partition('|')
+        try:
+            out[(emp, device)] = datetime.strptime(iso, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            continue
+    return out
+
+
+def _dump_last_sent(last_sent: dict) -> dict:
+    """Serialize the dedup memory, dropping entries too old to suppress anything.
+    Aged against the newest event seen, not the wall clock, so a backfill of old
+    serials still dedups correctly within itself."""
+    if not last_sent:
+        return {}
+    cutoff = max(last_sent.values()) - timedelta(minutes=max(MIN_GAP_MINUTES * 10, 60))
+    return {f"{emp}|{device}": t.strftime('%Y-%m-%d %H:%M:%S')
+            for (emp, device), t in last_sent.items() if t >= cutoff}
+
+
+def _log_device_gap(host: str, begin: int, end: int, expected: int, got: int) -> str:
+    """Record a hole in a device's own event log — these do not heal, so the
+    serial numbers are written down before the cursor moves past them."""
+    os.makedirs('errors', exist_ok=True)
+    path = os.path.join('errors', f"device_gap_{host.replace(':', '_')}_{datetime.now():%Y%m%d_%H%M%S}.json")
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump({'device': host, 'serial_begin': begin, 'serial_end': end,
+                   'expected': expected, 'found': got, 'missing': expected - got}, f, indent=2)
+    logger.error(f"{host}: {expected - got} event(s) missing from device log "
+                 f"(serial {begin}-{end}) — logged to {path}")
+    return path
+
+
+def run_device_cycle(host: str) -> tuple[bool, int]:
+    """Poll one FR terminal from its cursor to its newest serial, then send.
+
+    Returns (ok, records_sent). The cursor only advances once everything fetched
+    has been sent, so a failed cycle simply refetches the same span next time.
+    """
+    info = DeviceList[host]
+    label = f"{host} ({info['doorName']})"
+    sig = _device_signature(host)
+    state = device_events.load_state(host)
+    cursor = state['cursor']
+
+    # 1. Rymnet retry: re-send the batch that failed last cycle.
+    pending = checkpoint.load_pending(sig)
+    if pending:
+        logger.info(f"{label}: retrying pending batch ({len(pending['records'])} records)")
+        stop, _ = _send_resilient(pending['records'], pending['pages'], sig, label, pending.get('ids'))
+        if stop:
+            return False, 0
+        if not DRY_RUN:
+            checkpoint.clear_pending(sig)
+
+    newest, newest_time = device_events.newest_serial(host)
+
+    # 2. First run: start at the device's newest event; no backfill.
+    if cursor is None:
+        if not DRY_RUN:
+            device_events.save_state(host, newest)
+        logger.info(f"{label}: cursor initialised at serial {newest} ({newest_time}) — no backfill")
+        if not DRY_RUN:
+            notify(f"[HIK SYNC] Device {label} cursor initialised at serial {newest} ({newest_time}).\n"
+                   f"Earlier events are not sent. Edit state/devices/ to backfill.")
+        return True, 0
+
+    # 3. Counter went backwards: the device's log was wiped. Never restart from 1.
+    if newest < cursor:
+        logger.error(f"{label}: newest serial {newest} < cursor {cursor} — device log reset")
+        notify(f"[HIK SYNC] Device {label} event log was RESET (newest serial {newest} < cursor {cursor}).\n"
+               f"Cursor left untouched — fix state/devices/ manually before this device syncs again.")
+        return False, 0
+
+    if newest == cursor:
+        logger.info(f"{label}: nothing new (serial {cursor})")
+        return True, 0
+
+    # 4. Fetch the whole serial span. A hole in the device's log is permanent, so
+    #    salvage what arrived rather than stalling forever — but write it down.
+    begin = cursor + 1
+    try:
+        events = device_events.fetch_range(host, begin, newest)
+    except device_events.DeviceGapError as e:
+        path = _log_device_gap(host, begin, newest, e.expected, e.got)
+        notify(f"[HIK SYNC] Device {label}: {e.expected - e.got} event(s) missing from its own log "
+               f"(serial {begin}-{newest}).\nSending what remains. Details: {path}")
+        events = e.events
+
+    auth = device_events.auth_events(events)
+    logger.info(f"{label}: serial {begin}-{newest} — {len(events)} events, {len(auth)} authentications")
+
+    last_sent = _load_last_sent(state['last_sent'])
+    audited, deduped, dupes = _prepare_page(
+        auth, {}, set(), last_sent,
+        resolve=lambda item, _cache: _resolve_device_record(item, info),
+    )
+    _log_attendance(audited, datetime.now().isoformat())
+
+    if DRY_RUN:
+        record_ids = [None] * len(audited)
+    else:
+        try:
+            record_ids = db.insert_records(audited)
+            failed = sum(1 for r in record_ids if r is None)
+            if failed:
+                logger.error(f"{label}: DB insert {failed}/{len(record_ids)} record(s) failed")
+        except Exception as e:
+            logger.error(f"{label}: DB insert_records call failed: {e}")
+            record_ids = [None] * len(audited)
+    deduped_ids = [rid for rid, rec in zip(record_ids, audited) if not rec['duplicate']]
+
+    total = 0
+    for i in range(0, len(deduped), BATCH_SIZE):
+        batch = deduped[i:i + BATCH_SIZE]
+        stop, sent = _send_resilient(batch, [1], sig, label, deduped_ids[i:i + BATCH_SIZE])
+        if stop:
+            return False, total      # cursor stays put: this span is refetched next cycle
+        total += sent
+
+    if not DRY_RUN:
+        device_events.save_state(host, newest, _dump_last_sent(last_sent))
+        checkpoint.clear_window(sig)
+    logger.info(f"{label}: cycle done — {total} records sent, {dupes} duplicates skipped, cursor at {newest}")
+    return True, total
+
+
+def run_devices() -> int:
+    """One poll cycle for every device in DeviceList. Holds the cross-process send
+    lock so device and Artemis senders never overlap."""
+    if not DeviceList:
+        return 0
+
+    def _cycle_all() -> int:
+        sent = 0
+        for host in DeviceList:
+            try:
+                ok, n = run_device_cycle(host)
+                sent += n
+                if not ok:
+                    logger.warning(f"{host}: cycle did not complete — will resume next poll")
+            except device_events.DeviceFetchError as e:
+                logger.error(f"{host}: fetch failed — {e}")
+            except Exception as e:
+                logger.error(f"{host}: cycle error — {e}")
+        return sent
+
+    if DRY_RUN:
+        return _cycle_all()
+    with sendlock.send_lock():
+        return _cycle_all()
+
+
 def _next_window() -> tuple[datetime, datetime]:
     """Return (window_start, window_end) for the next 30-min boundary."""
     now = datetime.now()
@@ -425,7 +608,8 @@ def recover_windows() -> int:
     Returns records recovered."""
     queued = {(it['start'], it['end']) for it in checkpoint.load_failed()}
     orphans = [q for q in checkpoint.load_all_windows()
-               if (q['start'], q['end']) not in queued]
+               if (q['start'], q['end']) not in queued
+               and q['start'] != DEVICE_SIG_KEY]   # device state isn't a time window; run_devices retries it
     if not orphans:
         logger.info("No orphan windows to recover")
         return 0
@@ -442,8 +626,28 @@ def recover_windows() -> int:
     return sent
 
 
+def _sleep_polling_devices(until: datetime) -> int:
+    """Wait for the next window boundary, polling the FR terminals every
+    DEVICE_POLL_SECONDS on the way. Device fetching is cursor-based, so its
+    cadence is independent of the 30-minute windows — polling often just means
+    smaller spans and fresher attendance, never a missed event."""
+    sent = 0
+    while True:
+        remaining = (until - datetime.now()).total_seconds()
+        if remaining <= 0:
+            return sent
+        if not DeviceList:
+            time.sleep(remaining)
+            return sent
+        time.sleep(min(DEVICE_POLL_SECONDS, remaining))
+        if (until - datetime.now()).total_seconds() > 0:
+            sent += run_devices()
+
+
 def scheduler(reset: bool = False):
     logger.info("Scheduler started — running every 30 minutes, continuous.")
+    if DeviceList:
+        logger.info(f"Device path active for {', '.join(DeviceList)} — polling every {DEVICE_POLL_SECONDS}s")
     if reset:
         checkpoint.reset()
         logger.info("State reset — starting fresh")
@@ -452,8 +656,9 @@ def scheduler(reset: bool = False):
         win_start, win_end = _next_window()
         sleep_secs = (win_end - datetime.now()).total_seconds()
         logger.info(f"Sleeping {sleep_secs:.0f}s until window {_fmt(win_start)} → {_fmt(win_end)}")
-        time.sleep(max(0, sleep_secs))
+        daily_total += _sleep_polling_devices(win_end)
 
+        daily_total += run_devices()      # catch events right up to the boundary
         daily_total += _retry_failed_windows()
 
         ok, n = run_window(_fmt(win_start), _fmt(win_end))
@@ -478,6 +683,8 @@ if __name__ == '__main__':
                         help="Delete all files in state/windows/ and exit")
     parser.add_argument('--recover-windows', action='store_true',
                         help="Re-run orphan windows in state/windows/ (resume from checkpoint), then exit")
+    parser.add_argument('--devices-once', action='store_true',
+                        help="Run one device poll cycle per DeviceList entry (cursor-based), then exit")
     parser.add_argument('--start', metavar='DATETIME',
                         help="Test mode: window start, e.g. 2026-04-01T08:00:00")
     parser.add_argument('--end', metavar='DATETIME',
@@ -515,6 +722,12 @@ if __name__ == '__main__':
     if args.recover_windows:
         db.ACTOR = getpass.getuser()   # manual rerun — audit as the user
         recover_windows()
+        raise SystemExit(0)
+
+    if args.devices_once:
+        db.ACTOR = getpass.getuser()   # manual run — audit as the user
+        sent = run_devices()
+        logger.info(f"Device poll done — {sent} records sent")
         raise SystemExit(0)
 
     if args.start or args.end:

@@ -5,8 +5,8 @@ DoorList = {
     # 1553: {"type": "Controller", "doorName": "HQGF PARKING - CONT", "indicator": None},
     # 1592: {"type": "Controller", "doorName": "WHGF OUB LB 7 - CON", "indicator": None},
     # 4733: {"type": "Controller", "doorName": "WHCJ - CON", "indicator": None},
-    4729: {"type": "Door", "doorName": "WHCJ IN - FR", "indicator": "IN"}, ## THIS ONE
-    4741: {"type": "Door", "doorName": "WHCJ OUT - FR", "indicator": "OUT"}, ## THIS ONE
+    # 4729: {"type": "Door", "doorName": "WHCJ IN - FR", "indicator": "IN"}, ## moved to DeviceList (read from device over ISAPI)
+    # 4741: {"type": "Door", "doorName": "WHCJ OUT - FR", "indicator": "OUT"}, ## moved to DeviceList (read from device over ISAPI)
     # 1476: {"type": "Controller", "doorName": "WHGF BIN R - CON", "indicator": None}, #Controller
     # 1517: {"type": "Controller", "doorName": "WHGF OUB LB 16 - CON", "indicator": None}, #Controller
     # 3626: {"type": "Controller", "doorName": "REST CON ROOM - CON", "indicator": None}, #Controller
