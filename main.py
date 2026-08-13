@@ -46,6 +46,7 @@ MAX_WINDOW_RETRIES = 10  # retries (one per scheduler tick) before giving up on 
 MIN_GAP_MINUTES  = 1   # suppress duplicate events for the same person within this window
 DEVICE_SIG_KEY   = 'device'  # marks a checkpoint signature as belonging to the device path
 DEVICE_POLL_SECONDS = int(os.environ.get('DEVICE_POLL_SECONDS', '120'))  # device poll cadence inside the scheduler's sleep
+STEP_LOGGING     = os.environ.get('STEP_LOGGING', '').lower() == 'true'  # trace every step of the device (CJ) cycle
 FOREIGN_WORKER   = os.environ.get('FOREIGN_WORKER', '').lower() == 'true'
 DRY_RUN          = False  # set via --dry-run; skips Rymnet send + DB/checkpoint writes
 ONLY_EMPLOYEE_NO = None   # set via --employee-no; restrict processing to this employee_no
@@ -58,6 +59,12 @@ def _fmt(dt: datetime) -> str:
 
 def reformat_time(iso_str: str) -> str:
     return datetime.fromisoformat(iso_str).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _step(label: str, step: str, message: str):
+    """Trace one step of the device cycle when STEP_LOGGING=true."""
+    if STEP_LOGGING:
+        logger.info(f"[STEP {step}] {label}: {message}")
 
 
 # def notify_failure(label: str):
@@ -445,21 +452,29 @@ def run_device_cycle(host: str) -> tuple[bool, int]:
     sig = _device_signature(host)
     state = device_events.load_state(host)
     cursor = state['cursor']
+    _step(label, '0/9', f"cycle start — cursor={cursor}, dedup memory={len(state['last_sent'])} entries"
+                        f"{', DRY RUN' if DRY_RUN else ''}")
 
     # 1. Rymnet retry: re-send the batch that failed last cycle.
     pending = checkpoint.load_pending(sig)
+    _step(label, '1/9', f"pending batch from last cycle: "
+                        f"{len(pending['records']) if pending else 0} records")
     if pending:
         logger.info(f"{label}: retrying pending batch ({len(pending['records'])} records)")
         stop, _ = _send_resilient(pending['records'], pending['pages'], sig, label, pending.get('ids'))
         if stop:
+            _step(label, '1/9', "pending batch still rejected — stopping cycle, nothing fetched")
             return False, 0
         if not DRY_RUN:
             checkpoint.clear_pending(sig)
+        _step(label, '1/9', "pending batch cleared")
 
     newest, newest_time = device_events.newest_serial(host)
+    _step(label, '2/9', f"newest serial on device = {newest} ({newest_time})")
 
     # 2. First run: start at the device's newest event; no backfill.
     if cursor is None:
+        _step(label, '3/9', f"no cursor — bootstrapping at serial {newest}, no backfill")
         if not DRY_RUN:
             device_events.save_state(host, newest)
         logger.info(f"{label}: cursor initialised at serial {newest} ({newest_time}) — no backfill")
@@ -469,6 +484,8 @@ def run_device_cycle(host: str) -> tuple[bool, int]:
         return True, 0
 
     # 3. Counter went backwards: the device's log was wiped. Never restart from 1.
+    _step(label, '4/9', f"reset check: newest={newest} vs cursor={cursor} — "
+                        f"{'RESET' if newest < cursor else 'nothing new' if newest == cursor else f'{newest - cursor} new serial(s)'}")
     if newest < cursor:
         logger.error(f"{label}: newest serial {newest} < cursor {cursor} — device log reset")
         notify(f"[HIK SYNC] Device {label} event log was RESET (newest serial {newest} < cursor {cursor}).\n"
@@ -482,9 +499,11 @@ def run_device_cycle(host: str) -> tuple[bool, int]:
     # 4. Fetch the whole serial span. A hole in the device's log is permanent, so
     #    salvage what arrived rather than stalling forever — but write it down.
     begin = cursor + 1
+    _step(label, '5/9', f"fetching serial {begin}-{newest} (width {newest - begin + 1}), unfiltered")
     try:
         events = device_events.fetch_range(host, begin, newest)
     except device_events.DeviceGapError as e:
+        _step(label, '5/9', f"gap: device holds {e.got} of {e.expected} — salvaging {len(e.events)} event(s)")
         path = _log_device_gap(host, begin, newest, e.expected, e.got)
         notify(f"[HIK SYNC] Device {label}: {e.expected - e.got} event(s) missing from its own log "
                f"(serial {begin}-{newest}).\nSending what remains. Details: {path}")
@@ -492,12 +511,21 @@ def run_device_cycle(host: str) -> tuple[bool, int]:
 
     auth = device_events.auth_events(events)
     logger.info(f"{label}: serial {begin}-{newest} — {len(events)} events, {len(auth)} authentications")
+    _step(label, '6/9', f"auth filter (major {device_events.AUTH_MAJOR}/minor {device_events.AUTH_MINOR}): "
+                        f"{len(auth)} kept of {len(events)} fetched")
 
     last_sent = _load_last_sent(state['last_sent'])
     audited, deduped, dupes = _prepare_page(
         auth, {}, set(), last_sent,
         resolve=lambda item, _cache: _resolve_device_record(item, info),
     )
+    _step(label, '7/9', f"resolved: {len(audited)} audited, {len(deduped)} to send, {dupes} duplicate(s) "
+                        f"(<{MIN_GAP_MINUTES}min)")
+    if STEP_LOGGING:
+        for rec in audited:
+            _step(label, '7/9', f"  {'DUP ' if rec['duplicate'] else 'send'} "
+                                f"{rec.get('employee_no', '')} {rec.get('logtime', '')} "
+                                f"{rec.get('indicator', '')} @ {rec.get('location', '')}")
     _log_attendance(audited, datetime.now().isoformat())
 
     if DRY_RUN:
@@ -512,18 +540,24 @@ def run_device_cycle(host: str) -> tuple[bool, int]:
             logger.error(f"{label}: DB insert_records call failed: {e}")
             record_ids = [None] * len(audited)
     deduped_ids = [rid for rid, rec in zip(record_ids, audited) if not rec['duplicate']]
+    _step(label, '8/9', f"DB insert: {sum(1 for r in record_ids if r is not None)}/{len(audited)} row(s) "
+                        f"got ids, {len(deduped_ids)} status row(s) to follow")
 
     total = 0
     for i in range(0, len(deduped), BATCH_SIZE):
         batch = deduped[i:i + BATCH_SIZE]
+        _step(label, '9/9', f"sending batch {i // BATCH_SIZE + 1}/{(len(deduped) - 1) // BATCH_SIZE + 1} "
+                            f"({len(batch)} records)")
         stop, sent = _send_resilient(batch, [1], sig, label, deduped_ids[i:i + BATCH_SIZE])
         if stop:
+            _step(label, '9/9', f"batch rejected — cursor stays at {cursor}, span refetched next cycle")
             return False, total      # cursor stays put: this span is refetched next cycle
         total += sent
 
     if not DRY_RUN:
         device_events.save_state(host, newest, _dump_last_sent(last_sent))
         checkpoint.clear_window(sig)
+        _step(label, '9/9', f"cursor advanced {cursor} -> {newest}, dedup memory persisted")
     logger.info(f"{label}: cycle done — {total} records sent, {dupes} duplicates skipped, cursor at {newest}")
     return True, total
 
@@ -536,6 +570,8 @@ def run_devices() -> int:
 
     def _cycle_all() -> int:
         sent = 0
+        _step('devices', 'lock', f"send lock {'skipped (dry run)' if DRY_RUN else 'held'} — "
+                                 f"sweeping {len(DeviceList)} device(s)")
         for host in DeviceList:
             try:
                 ok, n = run_device_cycle(host)

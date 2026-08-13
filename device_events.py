@@ -36,6 +36,14 @@ PAGE_SIZE = 30                   # device caps maxResults at 30
 PAGE_PACE = 0.4                  # seconds between pages; devices answer 401 under rapid fire
 ATTEMPTS  = 5
 
+STEP_LOGGING = os.environ.get('STEP_LOGGING', '').lower() == 'true'  # trace every ISAPI step
+
+
+def _step(host: str, step: str, message: str):
+    """Trace one ISAPI step when STEP_LOGGING=true."""
+    if STEP_LOGGING:
+        logger.info(f"[STEP {step}] {host}: {message}")
+
 
 class DeviceFetchError(RuntimeError):
     """Device unreachable, or paging returned less than the device offered."""
@@ -94,6 +102,8 @@ def _search(host: str, cond: dict, pos: int = 0, limit: int = PAGE_SIZE, search_
     }}
     status = None
     for attempt in range(ATTEMPTS):
+        _step(host, 'isapi', f"POST AcsEvent searchID={search_id} pos={pos} maxResults={limit} "
+                             f"cond={cond} attempt {attempt + 1}/{ATTEMPTS}")
         try:
             r = _session(host).post(
                 f'http://{host}/ISAPI/AccessControl/AcsEvent?format=json',
@@ -103,9 +113,14 @@ def _search(host: str, cond: dict, pos: int = 0, limit: int = PAGE_SIZE, search_
         else:
             status = r.status_code
             if r.status_code == 200 and r.text.strip():
-                return json.loads(r.text)['AcsEvent']
+                data = json.loads(r.text)['AcsEvent']
+                _step(host, 'isapi', f"200 — numOfMatches={data.get('numOfMatches')} "
+                                     f"totalMatches={data.get('totalMatches')} "
+                                     f"status={data.get('responseStatusStrg')}")
+                return data
             if r.status_code == 401:
                 _sessions.pop(host, None)   # stale nonce — new session, new challenge
+        _step(host, 'isapi', f"retrying after status {status}")
         time.sleep(1.5 * (attempt + 1))
     raise DeviceFetchError(f"{host} pos={pos}: {ATTEMPTS} attempts failed, last status {status}")
 
@@ -139,6 +154,7 @@ def fetch_range(host: str, begin: int, end: int) -> list:
         total = d.get('totalMatches', 0)
         got = d.get('numOfMatches', 0)
         pos += got
+        _step(host, 'page', f"serial {begin}-{end}: +{got} events, {len(events)}/{total} so far")
         if d.get('responseStatusStrg') != 'MORE' or not got:
             break
         time.sleep(PAGE_PACE)
@@ -146,8 +162,11 @@ def fetch_range(host: str, begin: int, end: int) -> list:
     if len(events) != total:            # our paging lost rows the device offered
         raise DeviceFetchError(
             f"{host} serial {begin}-{end}: fetched {len(events)} but device reported {total}")
+    _step(host, 'check', f"paging complete: len(events)={len(events)} == totalMatches={total}")
 
     width = end - begin + 1
+    _step(host, 'check', f"contiguity: width={width} vs totalMatches={total} — "
+                         f"{'dense, no holes' if total == width else f'{width - total} missing'}")
     if total != width:                  # the device's own log is short
         raise DeviceGapError(
             f"{host} serial {begin}-{end}: expected {width} events, device has {total} "
@@ -163,6 +182,8 @@ def auth_events(events: list) -> list:
     auth = [e for e in events
             if e.get('major') == AUTH_MAJOR and e.get('minor') == AUTH_MINOR
             and e.get('employeeNoString')]
+    if STEP_LOGGING and events:
+        logger.info(f"[STEP filter] {len(auth)} authentication(s) of {len(events)} event(s), sorted by time")
     return sorted(auth, key=lambda e: (e['time'], e['serialNo']))
 
 
@@ -200,3 +221,5 @@ def save_state(host: str, cursor: int, last_sent: dict = None):
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(payload, f, indent=2)
     os.replace(tmp, _state_path(host))
+    _step(host, 'state', f"wrote {_state_path(host)}: cursor={cursor}, "
+                         f"{len(payload['last_sent'])} dedup entr(ies)")
