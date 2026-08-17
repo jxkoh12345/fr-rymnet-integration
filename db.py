@@ -64,6 +64,24 @@ def insert_records(records: list) -> list:
         return [None] * len(records)
 
 
+def count_records(start: str, end: str) -> int:
+    """How many hik_records rows already sit in [start, end] ('YYYY-MM-DD HH:MM:SS').
+    Visibility only — the catch-up sends regardless, Rymnet dedupes. -1 on failure."""
+    if not enabled():
+        return -1
+    try:
+        with _connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM hik_records"
+                " WHERE logtime >= %s AND logtime <= %s AND date_deleted IS NULL",
+                (start, end),
+            )
+            return cur.fetchone()[0]
+    except Exception as e:
+        logger.error(f"DB count_records failed: {e}")
+        return -1
+
+
 def set_status(record_ids: list, status: str):
     """Upsert hik_record_status for the given hik_records ids.
     First write for an id INSERTs (created_by='system'); later transitions

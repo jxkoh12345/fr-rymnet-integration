@@ -29,6 +29,7 @@ counter makes missing data arithmetic rather than guesswork. See
 - [Device path](#device-path-direct-from-the-fr-terminals)
 - [Database](#database)
 - [Reliability model](#reliability-model)
+- [Nightly catch-up](#nightly-catch-up)
 - [Commands](#commands)
 - [Common operational flows](#common-operational-flows)
 - [Configuration (`.env`)](#configuration-env)
@@ -299,16 +300,63 @@ Layered, each independent:
 | **Cross-process lock** | `sendlock` — `fcntl` file lock on `state/rymnet_send.lock` | a second sender **blocks** until the first finishes; prevents scheduler + manual tool both sending at once |
 | **Device cursor** | `state/devices/<ip>.json`, advanced only after a successful send | the same serial span is refetched next poll — no window to miss |
 | **Device completeness** | `totalMatches == width` and `len == totalMatches` in `fetch_range` | gap logged + alerted (survivors sent) / cycle aborted, cursor kept |
+| **Nightly catch-up** | `run_catchup()` after the midnight summary re-pulls the last `CATCHUP_DAYS` (3) days on both paths | anything the live paths lost inside that window is re-sent; Rymnet dedupes the overlap |
 
 A window's state file is **deleted on full success**, so `state/windows/` stays
 small. On every successful window the scheduler also sends a Lark "window done"
 notification.
 
+The device path notifies the same way: a **"device cycle done"** Lark note after
+any cycle that actually sent records (idle polls are silent — the scheduler polls
+every `DEVICE_POLL_SECONDS`, so notifying empty cycles would be pure noise), and
+a **"device range done"** note after every `--devices-start/--devices-end`
+backfill. Operator-triggered runs are tagged `(manual, <os-user>)`, and both
+`--devices-once` and the range backfill bracket themselves with a start/finish
+summary so a person can see their own run in Lark. `--dry-run` suppresses all of
+it.
+
+### Nightly catch-up
+
+Right after the midnight summary the scheduler re-pulls the **last
+`CATCHUP_DAYS` (3) days** — from `00:00` of D-3 to the present moment — on
+**both** paths and sends everything it finds:
+
+```
+00:00 tick → last window (23:30→00:00) → daily summary → catch-up 00:00 D-3 → now
+```
+
+Nothing is compared against what was already delivered. Rymnet dedupes on its
+side, so re-sending the whole range is cheaper than proving which records are
+new. The count of rows already in `hik_records` for the range is queried
+(`db.count_records`) and written to the log and the Lark note — **visibility
+only**, it never changes what is sent.
+
+The device half goes through `run_devices_range`, so the **cursor is untouched**
+and the live poll resumes exactly where it was. The Artemis half is one
+`run_window` over the whole range, checkpointed like any other window.
+
+Run it on demand:
+
+```bash
+uv run main.py --catchup             # same job, now, tagged (manual, <os-user>)
+uv run main.py --catchup --dry-run   # fetch/resolve only: no send, no DB, no state
+```
+
+Because the catch-up can outlast a 30-minute boundary and `_next_window()` is
+forward-only, `_queue_missed_windows()` pushes every boundary that closed during
+the run onto `state/failed.json`, where the normal per-tick retry picks it up.
+
 **Known gaps (not handled):**
 - **Missed windows during downtime** — `_next_window()` is forward-only; windows
-  missed while the host is down are not auto-caught-up (use a manual `--start/--end`
-  backfill). Applies to the **Artemis path only** — the device path resumes from
-  its cursor automatically.
+  missed while the host is down are not auto-caught-up beyond what the nightly
+  catch-up's 3-day sweep happens to cover (for anything older, use a manual
+  `--start/--end` backfill). Applies to the **Artemis path only** — the device
+  path resumes from its cursor automatically.
+- **The catch-up re-sends, it does not reconcile** — every record in the 3-day
+  range is POSTed again each night (Rymnet dedupes) and inserted into
+  `hik_records` again, so the audit table grows ~3 duplicate rows per record.
+  A D-3 day that fails outright is not retried the next night: the range slides
+  forward past it.
 - **Late uploads on the Artemis path** — a device that uploads after its window
   closed is lost silently, and nothing records that it happened. This is the
   failure the device path exists to remove; doors still on Artemis keep it.
@@ -341,7 +389,8 @@ uv run main.py --output-dir DIR  # write attendance.log under DIR instead of log
 ```
 
 The scheduler drives **both** paths: Artemis windows at each :00/:30 boundary,
-and a device poll every `DEVICE_POLL_SECONDS` (default 120) during the wait.
+and a device poll every `DEVICE_POLL_SECONDS` (default 120) during the wait. At
+midnight it also runs the [nightly catch-up](#nightly-catch-up).
 
 ### Device poll — one cycle per device, then exit
 
@@ -352,6 +401,23 @@ manual, or ad-hoc). Audits `modified_by` as the OS user.
 uv run main.py --devices-once
 uv run main.py --devices-once --dry-run   # fetch/resolve only: no send, no DB, no cursor advance
 ```
+
+### Device backfill — explicit time range
+
+Replay the FR terminals over a clock range instead of from the cursor. The
+**cursor is never read or written**, so the scheduler resumes exactly where it
+was. Completeness is still proven: serials inside a time window must be
+contiguous, so a hole raises `DeviceGapError` (survivors sent, gap logged).
+
+```bash
+uv run main.py --devices-start 2026-08-10T00:00:00 --devices-end 2026-08-11T00:00:00
+uv run main.py --devices-start ... --devices-end ... --dry-run                  # fetch/resolve only
+uv run main.py --devices-start ... --devices-end ... --device-host 10.1.72.122  # one device (repeatable)
+```
+
+Timezone (`+08:00`) is auto-appended if omitted. Dedup memory starts empty — the
+range dedups within itself and does not touch `state/devices/`. Rymnet-side
+dedupe is the only guard against double-counting a range already sent.
 
 ### Manual window — fetch + send to Rymnet
 
@@ -618,7 +684,7 @@ LARK_UNION_ID=on_...
 
 Tunable constants at the top of `main.py`: `BATCH_SIZE` (100), `SEND_RETRIES`
 (3), `SEND_RETRY_DELAY` (2s), `WINDOW_MINUTES` (30), `MAX_WINDOW_RETRIES` (10),
-`MIN_GAP_MINUTES` (5), `TIMEZONE`, `EVENT_TYPE`. Rate limit in
+`MIN_GAP_MINUTES` (5), `CATCHUP_DAYS` (3), `TIMEZONE`, `EVENT_TYPE`. Rate limit in
 `signature/final_data.py`: `RATE_LIMIT` (10), `RATE_WINDOW` (60s).
 
 ---
@@ -681,12 +747,17 @@ hik/
 | `run_devices() -> int` | One cycle per `DeviceList` entry, under the cross-process send lock. Per-device errors are isolated. |
 | `_resolve_device_record(item, info) -> dict` | Device event → Rymnet body. `employeeNoString` is already the `personCode`, so no person lookup. |
 | `_device_signature(host) -> dict` | Checkpoint identity for a device — keyed on the device, **not** the serial span, so a failed cycle's pending batch is still retried after the span moves. |
+| `run_device_range(host, start, end) -> (ok, sent)` | Replay one FR terminal over a clock range via `fetch_time_range`. Cursor never read or written; dedup memory starts empty. |
+| `run_devices_range(start, end, hosts=None) -> int` | One time-range backfill per device, under the cross-process send lock. |
+| `run_catchup() -> int` | **Nightly job.** Re-pull `00:00` of D-`CATCHUP_DAYS` → now on both paths and send everything (Rymnet dedupes). Logs the existing `hik_records` count for the range — visibility only. |
+| `_queue_missed_windows(after)` | Push every 30-min boundary that closed during a long job onto `state/failed.json`, so a slow catch-up delays windows instead of skipping them. |
 | `_sleep_polling_devices(until) -> int` | Wait for the next window boundary, polling devices every `DEVICE_POLL_SECONDS` on the way. |
 | `_prepare_page(..., resolve=None)` | `resolve` overrides the event→body mapping; defaults to the Artemis resolver. |
-| `scheduler(reset=False)` | Infinite loop: poll devices while sleeping to the boundary → retry failed → process window → midnight summary. |
+| `scheduler(reset=False)` | Infinite loop: poll devices while sleeping to the boundary → retry failed → process window → midnight summary → nightly catch-up. |
 
 **CLI:** `--reset`, `--clear-windows`, `--recover-windows`, `--devices-once`,
-`--start/--end`, `--output-dir`, `--dry-run`, `--employee-no`.
+`--devices-start/--devices-end` (+ `--device-host`), `--catchup`, `--start/--end`,
+`--output-dir`, `--dry-run`, `--employee-no`.
 
 ### `device_events.py`
 
@@ -706,6 +777,7 @@ Exceptions: `DeviceFetchError`, `DeviceGapError` (carries the survivors),
 |----------|-------------|
 | `enabled() -> bool` | True if `PG_HOST` and `PG_DATABASE` are set. |
 | `insert_records(records) -> list` | Insert every record into `hik_records`; returns new UUIDs aligned with input (`[None]*n` if disabled/failed). |
+| `count_records(start, end) -> int` | Rows already in `hik_records` for a `logtime` range (`-1` if disabled/failed). Used by the nightly catch-up for logging only. |
 | `set_status(record_ids, status)` | Upsert `hik_record_status`: first write inserts, later transitions update (`modified_by=ACTOR`). Skips `None` ids. |
 
 ### `checkpoint.py`
@@ -799,7 +871,9 @@ uv run python -m pytest tests/test_checkpoint.py -q     # a single file
 Covers: page-aligned batching, send-failure → pending save, resume-after-crash,
 pending-retry-first (no double-send), per-record isolation, window-retry
 recovery, give-up after `MAX_WINDOW_RETRIES`, dedup logic, foreign-worker
-filtering, DB status transitions, and the recover/pipeline paths.
+filtering, DB status transitions, the recover/pipeline paths, and the nightly
+catch-up (range spans `CATCHUP_DAYS` back to now on both paths, missed windows
+queued rather than skipped).
 
 `tests/test_device_sync.py` covers the device path: dense-range fetch, device-log
 gap, short-paging truncation, multi-page walk, auth filtering/sorting,

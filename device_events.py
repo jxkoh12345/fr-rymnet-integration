@@ -134,6 +134,31 @@ def newest_serial(host: str) -> tuple[int, str]:
     return info[0]['serialNo'], info[0]['time']
 
 
+def _fetch_all(host: str, cond: dict, label: str, prefix: str) -> tuple[list, int]:
+    """Page one AcsEvent search to exhaustion under a single searchID.
+    Returns (events, totalMatches) and raises DeviceFetchError if paging
+    retrieved less than the device offered."""
+    _seq[0] += 1
+    sid = f'{prefix}{_seq[0]}'
+    events, pos, total = [], 0, 0
+    while True:
+        d = _search(host, cond, pos=pos, search_id=sid)
+        events += d.get('InfoList', [])
+        total = d.get('totalMatches', 0)
+        got = d.get('numOfMatches', 0)
+        pos += got
+        _step(host, 'page', f"{label}: +{got} events, {len(events)}/{total} so far")
+        if d.get('responseStatusStrg') != 'MORE' or not got:
+            break
+        time.sleep(PAGE_PACE)
+
+    if len(events) != total:            # our paging lost rows the device offered
+        raise DeviceFetchError(
+            f"{host} {label}: fetched {len(events)} but device reported {total}")
+    _step(host, 'check', f"paging complete: len(events)={len(events)} == totalMatches={total}")
+    return events, total
+
+
 def fetch_range(host: str, begin: int, end: int) -> list:
     """Every event with begin <= serialNo <= end, unfiltered.
 
@@ -145,24 +170,7 @@ def fetch_range(host: str, begin: int, end: int) -> list:
     Raises DeviceGapError if the device's log has holes in the span.
     """
     cond = {'major': 0, 'minor': 0, 'beginSerialNo': begin, 'endSerialNo': end}
-    _seq[0] += 1
-    sid = f'range{_seq[0]}'
-    events, pos, total = [], 0, 0
-    while True:
-        d = _search(host, cond, pos=pos, search_id=sid)
-        events += d.get('InfoList', [])
-        total = d.get('totalMatches', 0)
-        got = d.get('numOfMatches', 0)
-        pos += got
-        _step(host, 'page', f"serial {begin}-{end}: +{got} events, {len(events)}/{total} so far")
-        if d.get('responseStatusStrg') != 'MORE' or not got:
-            break
-        time.sleep(PAGE_PACE)
-
-    if len(events) != total:            # our paging lost rows the device offered
-        raise DeviceFetchError(
-            f"{host} serial {begin}-{end}: fetched {len(events)} but device reported {total}")
-    _step(host, 'check', f"paging complete: len(events)={len(events)} == totalMatches={total}")
+    events, total = _fetch_all(host, cond, f"serial {begin}-{end}", 'range')
 
     width = end - begin + 1
     _step(host, 'check', f"contiguity: width={width} vs totalMatches={total} — "
@@ -171,6 +179,33 @@ def fetch_range(host: str, begin: int, end: int) -> list:
         raise DeviceGapError(
             f"{host} serial {begin}-{end}: expected {width} events, device has {total} "
             f"({width - total} missing from the device log)",
+            events, width, total)
+    return events
+
+
+def fetch_time_range(host: str, start: str, end: str) -> list:
+    """Every event with start <= time <= end, unfiltered.
+
+    The cursor path asks for numbered slots; this asks for a clock range, for
+    replaying a known period (a Rymnet deletion, a gap someone spotted) without
+    touching the cursor. Completeness is still provable: serials are dense and
+    monotonic with time, so the serials inside a time window must be contiguous.
+    Raises DeviceGapError if they are not.
+    """
+    cond = {'major': 0, 'minor': 0, 'startTime': start, 'endTime': end}
+    events, total = _fetch_all(host, cond, f"time {start} to {end}", 'trange')
+    if not events:
+        _step(host, 'check', "no events in range")
+        return events
+
+    serials = [e['serialNo'] for e in events]
+    width = max(serials) - min(serials) + 1
+    _step(host, 'check', f"contiguity: serial {min(serials)}-{max(serials)} width={width} vs "
+                         f"{total} fetched — {'dense, no holes' if total == width else f'{width - total} missing'}")
+    if total != width:                  # the device's own log is short
+        raise DeviceGapError(
+            f"{host} time {start} to {end}: serials {min(serials)}-{max(serials)} span {width} "
+            f"events but device has {total} ({width - total} missing from the device log)",
             events, width, total)
     return events
 

@@ -45,11 +45,14 @@ WINDOW_MINUTES   = 30  # fetch window size
 MAX_WINDOW_RETRIES = 10  # retries (one per scheduler tick) before giving up on a failed window
 MIN_GAP_MINUTES  = 1   # suppress duplicate events for the same person within this window
 DEVICE_SIG_KEY   = 'device'  # marks a checkpoint signature as belonging to the device path
+CATCHUP_DAYS     = 3   # nightly catch-up depth: re-pull from 00:00 this many days back to now
 DEVICE_POLL_SECONDS = int(os.environ.get('DEVICE_POLL_SECONDS', '120'))  # device poll cadence inside the scheduler's sleep
 STEP_LOGGING     = os.environ.get('STEP_LOGGING', '').lower() == 'true'  # trace every step of the device (CJ) cycle
 FOREIGN_WORKER   = os.environ.get('FOREIGN_WORKER', '').lower() == 'true'
 DRY_RUN          = False  # set via --dry-run; skips Rymnet send + DB/checkpoint writes
 ONLY_EMPLOYEE_NO = None   # set via --employee-no; restrict processing to this employee_no
+MANUAL           = False  # True for operator-triggered runs; tags notifications so a Lark
+                          # message is traceable to a person rather than the scheduler
 _fw_roster_cache = None   # lazily populated by _get_fw_roster()
 
 
@@ -405,6 +408,11 @@ def _device_signature(host: str) -> dict:
     return checkpoint.query_signature(DEVICE_SIG_KEY, host, [host], EVENT_TYPE)
 
 
+def _trigger() -> str:
+    """Notification suffix marking who started the run."""
+    return f" (manual, {db.ACTOR})" if MANUAL else ""
+
+
 def _load_last_sent(raw: dict) -> dict:
     """'<employee_no>|<device>' → datetime, for the cross-cycle dedup memory."""
     out = {}
@@ -559,7 +567,123 @@ def run_device_cycle(host: str) -> tuple[bool, int]:
         checkpoint.clear_window(sig)
         _step(label, '9/9', f"cursor advanced {cursor} -> {newest}, dedup memory persisted")
     logger.info(f"{label}: cycle done — {total} records sent, {dupes} duplicates skipped, cursor at {newest}")
+    # Only when something was actually sent: the scheduler polls every
+    # DEVICE_POLL_SECONDS, so notifying idle cycles would be pure noise.
+    if not DRY_RUN and total:
+        notify(
+            f"[HIK SYNC] Device cycle done{_trigger()}: {label}\n"
+            f"serial {begin} → {newest}\n"
+            f"{total} records sent, {dupes} duplicates skipped"
+        )
     return True, total
+
+
+def run_device_range(host: str, start: str, end: str) -> tuple[bool, int]:
+    """Replay one FR terminal over an explicit time range, then send.
+
+    A backfill, not a poll: the cursor is never read or written, so the live
+    scheduler resumes exactly where it was. Dedup memory starts empty — the
+    range dedups within itself. Rymnet-side dedupe is the only guard against
+    double-counting a range that was already sent.
+    """
+    info = DeviceList[host]
+    label = f"{host} ({info['doorName']})"
+    sig = _device_signature(host)
+    _step(label, '0/6', f"range backfill {start} to {end}{', DRY RUN' if DRY_RUN else ''}")
+
+    _step(label, '1/6', "fetching time range, unfiltered")
+    try:
+        events = device_events.fetch_time_range(host, start, end)
+    except device_events.DeviceGapError as e:
+        serials = [ev['serialNo'] for ev in e.events]
+        _step(label, '1/6', f"gap: device holds {e.got} of {e.expected} — salvaging {len(e.events)} event(s)")
+        path = _log_device_gap(host, min(serials), max(serials), e.expected, e.got)
+        notify(f"[HIK SYNC] Device {label}: {e.expected - e.got} event(s) missing from its own log "
+               f"({start} to {end}).\nSending what remains. Details: {path}")
+        events = e.events
+
+    auth = device_events.auth_events(events)
+    logger.info(f"{label}: {start} to {end} — {len(events)} events, {len(auth)} authentications")
+    _step(label, '2/6', f"auth filter (major {device_events.AUTH_MAJOR}/minor {device_events.AUTH_MINOR}): "
+                        f"{len(auth)} kept of {len(events)} fetched")
+
+    last_sent: dict = {}
+    audited, deduped, dupes = _prepare_page(
+        auth, {}, set(), last_sent,
+        resolve=lambda item, _cache: _resolve_device_record(item, info),
+    )
+    _step(label, '3/6', f"resolved: {len(audited)} audited, {len(deduped)} to send, {dupes} duplicate(s) "
+                        f"(<{MIN_GAP_MINUTES}min)")
+    if STEP_LOGGING:
+        for rec in audited:
+            _step(label, '3/6', f"  {'DUP ' if rec['duplicate'] else 'send'} "
+                                f"{rec.get('employee_no', '')} {rec.get('logtime', '')} "
+                                f"{rec.get('indicator', '')} @ {rec.get('location', '')}")
+    _log_attendance(audited, datetime.now().isoformat())
+
+    if DRY_RUN:
+        record_ids = [None] * len(audited)
+    else:
+        try:
+            record_ids = db.insert_records(audited)
+            failed = sum(1 for r in record_ids if r is None)
+            if failed:
+                logger.error(f"{label}: DB insert {failed}/{len(record_ids)} record(s) failed")
+        except Exception as e:
+            logger.error(f"{label}: DB insert_records call failed: {e}")
+            record_ids = [None] * len(audited)
+    deduped_ids = [rid for rid, rec in zip(record_ids, audited) if not rec['duplicate']]
+    _step(label, '4/6', f"DB insert: {sum(1 for r in record_ids if r is not None)}/{len(audited)} row(s) "
+                        f"got ids, {len(deduped_ids)} status row(s) to follow")
+
+    total = 0
+    for i in range(0, len(deduped), BATCH_SIZE):
+        batch = deduped[i:i + BATCH_SIZE]
+        _step(label, '5/6', f"sending batch {i // BATCH_SIZE + 1}/{(len(deduped) - 1) // BATCH_SIZE + 1} "
+                            f"({len(batch)} records)")
+        stop, sent = _send_resilient(batch, [1], sig, label, deduped_ids[i:i + BATCH_SIZE])
+        if stop:
+            _step(label, '5/6', "batch rejected — saved as pending, retried by the next device cycle")
+            return False, total
+        total += sent
+
+    _step(label, '6/6', "range complete — cursor untouched")
+    logger.info(f"{label}: range done — {total} records sent, {dupes} duplicates skipped")
+    if not DRY_RUN:
+        notify(
+            f"[HIK SYNC] Device range done{_trigger()}: {label}\n"
+            f"{start} → {end}\n"
+            f"{total} records sent, {dupes} duplicates skipped (cursor untouched)"
+        )
+    return True, total
+
+
+def run_devices_range(start: str, end: str, hosts: list = None) -> int:
+    """One time-range backfill per device, under the cross-process send lock."""
+    targets = hosts or list(DeviceList)
+    if not targets:
+        return 0
+
+    def _range_all() -> int:
+        sent = 0
+        _step('devices', 'lock', f"send lock {'skipped (dry run)' if DRY_RUN else 'held'} — "
+                                 f"backfilling {len(targets)} device(s) over {start} to {end}")
+        for host in targets:
+            try:
+                ok, n = run_device_range(host, start, end)
+                sent += n
+                if not ok:
+                    logger.warning(f"{host}: range backfill did not complete")
+            except device_events.DeviceFetchError as e:
+                logger.error(f"{host}: fetch failed — {e}")
+            except Exception as e:
+                logger.error(f"{host}: range error — {e}")
+        return sent
+
+    if DRY_RUN:
+        return _range_all()
+    with sendlock.send_lock():
+        return _range_all()
 
 
 def run_devices() -> int:
@@ -680,6 +804,50 @@ def _sleep_polling_devices(until: datetime) -> int:
             sent += run_devices()
 
 
+def run_catchup() -> int:
+    """Re-pull the last CATCHUP_DAYS days on both paths and send everything.
+
+    Runs once a night, after the midnight summary. It exists to sweep up what the
+    live paths can lose: an Artemis window that closed before a device uploaded,
+    or a device span whose send failed. Nothing is compared against what was
+    already delivered — Rymnet dedupes, so re-sending is cheaper than proving
+    which records are new. The hik_records count is logged for visibility only.
+    """
+    now = datetime.now()
+    start = (now - timedelta(days=CATCHUP_DAYS)).replace(hour=0, minute=0, second=0, microsecond=0)
+    s, e = _fmt(start), _fmt(now)
+    existing = db.count_records(start.strftime('%Y-%m-%d %H:%M:%S'), now.strftime('%Y-%m-%d %H:%M:%S'))
+    held = f"{existing} record(s)" if existing >= 0 else "unknown (no DB sink)"
+    logger.info(f"=== Catch-up {s} → {e} — hik_records already holds {held} ==="
+                f"{' [DRY RUN]' if DRY_RUN else ''}")
+
+    sent = 0
+    if DeviceList:
+        sent += run_devices_range(start=s, end=e)
+    ok, n = run_window(s, e)
+    sent += n
+    if not ok:
+        logger.error(f"Catch-up window {s} → {e} did not complete — pending batch left for retry")
+    logger.info(f"Catch-up done — {sent} records sent")
+    if not DRY_RUN:
+        notify(f"[HIK SYNC] Catch-up done{_trigger()}: {s} → {e}\n"
+               f"{sent} records sent\nhik_records held {held} for this range before the run")
+    return sent
+
+
+def _queue_missed_windows(after: datetime):
+    """Queue every 30-min window that closed while a long job was running.
+    _next_window() is forward-only, so without this a catch-up lasting past the
+    next boundary would make the scheduler skip that window outright."""
+    boundary = after
+    while boundary + timedelta(minutes=WINDOW_MINUTES) <= datetime.now():
+        win_end = boundary + timedelta(minutes=WINDOW_MINUTES)
+        checkpoint.add_failed(_fmt(boundary), _fmt(win_end))
+        logger.warning(f"Window {_fmt(boundary)} → {_fmt(win_end)} closed during the catch-up "
+                       f"— queued for retry")
+        boundary = win_end
+
+
 def scheduler(reset: bool = False):
     logger.info("Scheduler started — running every 30 minutes, continuous.")
     if DeviceList:
@@ -709,6 +877,8 @@ def scheduler(reset: bool = False):
             notify(f"[HIK SYNC] Daily summary {date_label}: {daily_total} records sent")
             logger.info(f"Daily summary {date_label}: {daily_total} records sent")
             daily_total = 0
+            run_catchup()
+            _queue_missed_windows(win_end)
 
 
 if __name__ == '__main__':
@@ -721,6 +891,15 @@ if __name__ == '__main__':
                         help="Re-run orphan windows in state/windows/ (resume from checkpoint), then exit")
     parser.add_argument('--devices-once', action='store_true',
                         help="Run one device poll cycle per DeviceList entry (cursor-based), then exit")
+    parser.add_argument('--catchup', action='store_true',
+                        help=f"Run the nightly catch-up now: re-pull both paths from 00:00 "
+                             f"{CATCHUP_DAYS} days ago to now and send, then exit")
+    parser.add_argument('--devices-start', metavar='DATETIME',
+                        help="Device backfill: range start, e.g. 2026-08-10T00:00:00 (cursor untouched)")
+    parser.add_argument('--devices-end', metavar='DATETIME',
+                        help="Device backfill: range end,   e.g. 2026-08-11T00:00:00")
+    parser.add_argument('--device-host', metavar='IP', action='append',
+                        help="Limit --devices-start/--devices-end to this device (repeatable; default: all)")
     parser.add_argument('--start', metavar='DATETIME',
                         help="Test mode: window start, e.g. 2026-04-01T08:00:00")
     parser.add_argument('--end', metavar='DATETIME',
@@ -760,10 +939,41 @@ if __name__ == '__main__':
         recover_windows()
         raise SystemExit(0)
 
+    if args.catchup:
+        db.ACTOR = getpass.getuser()   # manual run — audit as the user
+        MANUAL = True
+        run_catchup()
+        raise SystemExit(0)
+
     if args.devices_once:
         db.ACTOR = getpass.getuser()   # manual run — audit as the user
+        MANUAL = True
         sent = run_devices()
         logger.info(f"Device poll done — {sent} records sent")
+        if not DRY_RUN:
+            notify(f"[HIK SYNC] Manual device poll finished ({db.ACTOR}): "
+                   f"{sent} records sent across {len(DeviceList)} device(s)")
+        raise SystemExit(0)
+
+    if args.devices_start or args.devices_end:
+        if not (args.devices_start and args.devices_end):
+            parser.error("--devices-start and --devices-end must be used together")
+        hosts = args.device_host or list(DeviceList)
+        unknown = [h for h in hosts if h not in DeviceList]
+        if unknown:
+            parser.error(f"--device-host not in DeviceList: {', '.join(unknown)}")
+        db.ACTOR = getpass.getuser()   # manual rerun — audit as the user
+        MANUAL = True
+        start = args.devices_start if '+' in args.devices_start else args.devices_start + TIMEZONE
+        end   = args.devices_end   if '+' in args.devices_end   else args.devices_end   + TIMEZONE
+        if not DRY_RUN:
+            notify(f"[HIK SYNC] Manual device backfill started ({db.ACTOR}): {start} → {end}\n"
+                   f"{len(hosts)} device(s): {', '.join(hosts)}")
+        sent = run_devices_range(start=start, end=end, hosts=hosts)
+        logger.info(f"Device range backfill done — {sent} records sent")
+        if not DRY_RUN:
+            notify(f"[HIK SYNC] Manual device backfill finished ({db.ACTOR}): "
+                   f"{sent} records sent, {start} → {end}")
         raise SystemExit(0)
 
     if args.start or args.end:

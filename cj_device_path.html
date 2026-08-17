@@ -1,0 +1,1156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CJ Direct Device Path</title>
+
+<style>
+img, svg, table { max-width: 100%; }
+
+:root {
+  --ground:        #eceef1;
+  --panel:         #f8f9fb;
+  --panel-2:       #e3e7ec;
+  --ink:           #151a20;
+  --ink-soft:      #3c454f;
+  --muted:         #616c78;
+  --rule:          #c6ccd3;
+  --rule-soft:     #d8dde3;
+  --accent:        #1f3f78;
+  --accent-soft:   #dfe6f4;
+  --in:            #0c6c5d;
+  --in-soft:       #d7ece7;
+  --out:           #a3441c;
+  --out-soft:      #f6e2d8;
+  --ok:            #2c6f3a;
+  --warn:          #96690a;
+  --crit:          #9e2823;
+  --ok-soft:       #dfeee2;
+  --warn-soft:     #f6ecd4;
+  --crit-soft:     #f7e0de;
+  --shadow:        0 1px 2px rgba(21,26,32,.06), 0 8px 24px -18px rgba(21,26,32,.35);
+
+  --mono: ui-monospace, "Cascadia Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+  --body: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --display: ui-serif, Georgia, "Iowan Old Style", "Times New Roman", serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground:      #11151a;
+    --panel:       #181d23;
+    --panel-2:     #212832;
+    --ink:         #e7ebef;
+    --ink-soft:    #c2cad3;
+    --muted:       #8e9aa6;
+    --rule:        #2d353f;
+    --rule-soft:   #242b34;
+    --accent:      #8fb0e8;
+    --accent-soft: #1b2637;
+    --in:          #43c3a6;
+    --in-soft:     #102b28;
+    --out:         #e5875a;
+    --out-soft:    #2e1c14;
+    --ok:          #62b978;
+    --warn:        #d2a33c;
+    --crit:        #e2756c;
+    --ok-soft:     #142616;
+    --warn-soft:   #2a2010;
+    --crit-soft:   #2c1614;
+    --shadow:      0 1px 2px rgba(0,0,0,.4), 0 10px 30px -20px rgba(0,0,0,.8);
+  }
+}
+
+:root[data-theme="dark"] {
+  --ground:      #11151a;
+  --panel:       #181d23;
+  --panel-2:     #212832;
+  --ink:         #e7ebef;
+  --ink-soft:    #c2cad3;
+  --muted:       #8e9aa6;
+  --rule:        #2d353f;
+  --rule-soft:   #242b34;
+  --accent:      #8fb0e8;
+  --accent-soft: #1b2637;
+  --in:          #43c3a6;
+  --in-soft:     #102b28;
+  --out:         #e5875a;
+  --out-soft:    #2e1c14;
+  --ok:          #62b978;
+  --warn:        #d2a33c;
+  --crit:        #e2756c;
+  --ok-soft:     #142616;
+  --warn-soft:   #2a2010;
+  --crit-soft:   #2c1614;
+  --shadow:      0 1px 2px rgba(0,0,0,.4), 0 10px 30px -20px rgba(0,0,0,.8);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--body);
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap {
+  max-width: 1060px;
+  margin: 0 auto;
+  padding: 0 24px 96px;
+}
+
+/* ---------- masthead ---------- */
+
+.mast {
+  border-bottom: 1px solid var(--rule);
+  padding: 56px 0 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.eyebrow {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+h1 {
+  font-family: var(--display);
+  font-weight: 600;
+  font-size: clamp(34px, 6vw, 56px);
+  line-height: 1.05;
+  letter-spacing: -.02em;
+  margin: 0;
+  text-wrap: balance;
+}
+.lede {
+  font-size: 18px;
+  color: var(--ink-soft);
+  max-width: 66ch;
+  margin: 0;
+}
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  letter-spacing: .03em;
+  padding: 4px 9px;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  color: var(--ink-soft);
+  background: var(--panel);
+  white-space: nowrap;
+}
+
+/* ---------- sections ---------- */
+
+section { padding: 52px 0 0; }
+.sec-head { display: flex; flex-direction: column; gap: 6px; margin-bottom: 22px; }
+h2 {
+  font-family: var(--display);
+  font-weight: 600;
+  font-size: clamp(23px, 3.2vw, 31px);
+  line-height: 1.15;
+  letter-spacing: -.01em;
+  margin: 0;
+  text-wrap: balance;
+}
+h3 {
+  font-family: var(--body);
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 0 0 10px;
+}
+p { max-width: 68ch; margin: 0 0 14px; color: var(--ink-soft); }
+p.tight { margin-bottom: 0; }
+strong { color: var(--ink); font-weight: 620; }
+code {
+  font-family: var(--mono);
+  font-size: .88em;
+  background: var(--panel-2);
+  border-radius: 2px;
+  padding: 1px 4px;
+  color: var(--ink);
+}
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  padding: 20px;
+  box-shadow: var(--shadow);
+}
+.panel + .panel { margin-top: 14px; }
+.grid-2 { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+.scroll { overflow-x: auto; }
+
+/* ---------- tables ---------- */
+
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th {
+  text-align: left;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .09em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 500;
+  padding: 0 14px 8px 0;
+  border-bottom: 1px solid var(--rule);
+  white-space: nowrap;
+}
+td {
+  padding: 9px 14px 9px 0;
+  border-bottom: 1px solid var(--rule-soft);
+  vertical-align: top;
+  color: var(--ink-soft);
+}
+tr:last-child td { border-bottom: none; }
+td.m, th.m { font-family: var(--mono); font-size: 12.5px; font-variant-numeric: tabular-nums; color: var(--ink); white-space: nowrap; }
+
+.tag {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 2px;
+  border: 1px solid currentColor;
+}
+.t-in   { color: var(--in);   background: var(--in-soft); }
+.t-out  { color: var(--out);  background: var(--out-soft); }
+.t-ok   { color: var(--ok);   background: var(--ok-soft); }
+.t-warn { color: var(--warn); background: var(--warn-soft); }
+.t-crit { color: var(--crit); background: var(--crit-soft); }
+
+/* ---------- serial ribbon ---------- */
+
+.ribbon-wrap { display: flex; flex-direction: column; gap: 12px; }
+.ribbon {
+  display: flex;
+  gap: 3px;
+  min-width: max-content;
+  padding-bottom: 4px;
+}
+.slot {
+  width: 74px;
+  border: 1px solid var(--rule);
+  border-top-width: 3px;
+  border-radius: 2px;
+  background: var(--panel-2);
+  padding: 5px 6px 7px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.slot .sn { font-size: 12px; font-weight: 600; color: var(--ink); }
+.slot .tm { font-size: 9.5px; color: var(--muted); }
+.slot .kind { font-size: 9.5px; letter-spacing: .04em; text-transform: uppercase; }
+.slot .who { font-size: 9.5px; color: var(--ink-soft); overflow: hidden; text-overflow: ellipsis; }
+.slot.auth { border-top-color: var(--in); background: var(--in-soft); }
+.slot.auth .kind { color: var(--in); }
+.slot.door { border-top-color: var(--rule); }
+.slot.door .kind { color: var(--muted); }
+.slot.sys  { border-top-color: var(--muted); }
+.slot.sys .kind { color: var(--muted); }
+.slot.dup { border-top-color: var(--warn); background: var(--warn-soft); }
+.slot.dup .kind { color: var(--warn); }
+.slot.hole {
+  border-style: dashed;
+  border-top-color: var(--crit);
+  background: repeating-linear-gradient(135deg, transparent 0 5px, var(--crit-soft) 5px 10px);
+}
+.slot.hole .kind { color: var(--crit); }
+.slot.cursor {
+  border-top-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.slot.cursor .kind { color: var(--accent); }
+
+.legend { display: flex; flex-wrap: wrap; gap: 14px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.swatch { width: 20px; height: 4px; border-radius: 1px; display: inline-block; }
+
+.arith {
+  display: grid;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  margin-top: 14px;
+}
+.arith .row {
+  display: grid;
+  grid-template-columns: minmax(150px, 200px) 1fr auto;
+  gap: 12px;
+  align-items: baseline;
+  padding: 8px 10px;
+  border-left: 3px solid var(--ok);
+  background: var(--panel-2);
+  border-radius: 0 2px 2px 0;
+}
+.arith .row.bad { border-left-color: var(--crit); }
+.arith .row .lbl { color: var(--muted); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; }
+.arith .row .verdict { color: var(--ok); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; }
+.arith .row.bad .verdict { color: var(--crit); }
+
+/* ---------- gate ladder ---------- */
+
+.ladder { display: flex; flex-direction: column; gap: 10px; counter-reset: gate; }
+.gate {
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 3px 3px 0;
+  padding: 14px 16px;
+  display: grid;
+  grid-template-columns: 30px 1fr;
+  gap: 14px;
+  box-shadow: var(--shadow);
+}
+.gate::before {
+  counter-increment: gate;
+  content: counter(gate, decimal-leading-zero);
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--accent);
+  padding-top: 2px;
+  font-variant-numeric: tabular-nums;
+}
+.gate .fn {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--ink);
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.gate .what { font-size: 14.5px; color: var(--ink-soft); max-width: 70ch; margin: 0 0 10px; }
+.branches { display: flex; flex-direction: column; gap: 6px; }
+.branch {
+  display: grid;
+  grid-template-columns: minmax(0, 210px) 1fr;
+  gap: 10px;
+  align-items: baseline;
+  font-size: 13.5px;
+  padding: 6px 8px;
+  background: var(--panel-2);
+  border-radius: 2px;
+  border-left: 2px solid var(--rule);
+}
+.branch .cond { font-family: var(--mono); font-size: 12px; color: var(--ink); }
+.branch .res { color: var(--ink-soft); }
+.branch.ok   { border-left-color: var(--ok); }
+.branch.warn { border-left-color: var(--warn); }
+.branch.crit { border-left-color: var(--crit); }
+.branch.idle { border-left-color: var(--muted); }
+
+/* ---------- transform chain ---------- */
+
+.chain { display: flex; flex-direction: column; gap: 0; }
+.stage {
+  border: 1px solid var(--rule);
+  background: var(--panel);
+  border-radius: 3px;
+  padding: 14px 16px;
+  box-shadow: var(--shadow);
+}
+.stage .hd {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: baseline;
+  margin-bottom: 10px;
+}
+.stage .hd .name { font-family: var(--mono); font-size: 12.5px; font-weight: 600; color: var(--ink); }
+.stage .hd .note { font-size: 12.5px; color: var(--muted); }
+.link {
+  height: 22px;
+  margin-left: 24px;
+  border-left: 2px solid var(--rule);
+  position: relative;
+}
+.link::after {
+  content: "";
+  position: absolute;
+  left: -4px;
+  bottom: 0;
+  width: 6px; height: 6px;
+  border-right: 2px solid var(--rule);
+  border-bottom: 2px solid var(--rule);
+  transform: rotate(45deg);
+}
+pre {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+  background: var(--panel-2);
+  border: 1px solid var(--rule-soft);
+  border-radius: 2px;
+  padding: 12px;
+  margin: 0;
+  overflow-x: auto;
+  color: var(--ink);
+  tab-size: 2;
+}
+pre .k { color: var(--accent); }
+pre .s { color: var(--in); }
+pre .n { color: var(--out); }
+pre .c { color: var(--muted); }
+
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-family: var(--mono); font-size: 12.5px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; color: var(--ink); }
+
+.callout {
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--warn);
+  background: var(--warn-soft);
+  border-radius: 0 3px 3px 0;
+  padding: 12px 16px;
+  margin-top: 16px;
+}
+.callout p { color: var(--ink); margin: 0; }
+.callout .lbl {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--warn);
+  display: block;
+  margin-bottom: 4px;
+}
+
+figcaption {
+  font-size: 12.5px;
+  color: var(--muted);
+  margin-top: 10px;
+  max-width: 72ch;
+}
+figure { margin: 0; }
+
+svg { display: block; max-width: 100%; height: auto; }
+.svg-scroll { overflow-x: auto; }
+
+footer {
+  margin-top: 64px;
+  padding-top: 20px;
+  border-top: 1px solid var(--rule);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--muted);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .slot { animation: rise .38s ease-out both; }
+  @keyframes rise { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
+}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+<header class="mast">
+  <div class="eyebrow">hik → rymnet · device path</div>
+  <h1>CJ Direct Device Path</h1>
+  <p class="lede">Two WHCJ doors bypass the Artemis server entirely: the scheduler reads the FR
+  terminals over ISAPI and walks each device's own gap-free event counter. Every step below is
+  what the code actually does — <code>main.run_device_cycle</code> and <code>device_events.py</code>.</p>
+  <div class="chips">
+    <span class="chip">10.1.72.122 · WHCJ IN - FR</span>
+    <span class="chip">10.1.72.119 · WHCJ OUT - FR</span>
+    <span class="chip">DEVICE_POLL_SECONDS 120</span>
+    <span class="chip">PAGE_SIZE 30</span>
+    <span class="chip">BATCH_SIZE 100</span>
+    <span class="chip">MIN_GAP_MINUTES 1</span>
+  </div>
+</header>
+
+<!-- ================= 1. THE DOORS ================= -->
+<section>
+  <div class="sec-head">
+    <div class="eyebrow">the two doors</div>
+    <h2>What is read directly, and what it replaced</h2>
+  </div>
+  <p><code>DeviceList.py</code> maps device IP to door metadata. Both doors are
+  <strong>commented out of <code>DoorList</code></strong>, so the Artemis window path no longer
+  fetches them — a record can only arrive by one route, never both.</p>
+  <div class="panel scroll">
+    <table>
+      <thead>
+        <tr><th class="m">device ip</th><th class="m">doorIndexCode</th><th>doorName</th><th>indicator</th><th>read by</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="m">10.1.72.122</td><td class="m">4729</td>
+          <td class="m">WHCJ IN - FR</td>
+          <td><span class="tag t-in">in</span></td>
+          <td>ISAPI <code>AcsEvent</code> on port 80</td>
+        </tr>
+        <tr>
+          <td class="m">10.1.72.119</td><td class="m">4741</td>
+          <td class="m">WHCJ OUT - FR</td>
+          <td><span class="tag t-out">out</span></td>
+          <td>ISAPI <code>AcsEvent</code> on port 80</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout">
+    <span class="lbl">why it is safe to switch</span>
+    <p>Both mappings were confirmed by parity, not assumption: the device's own log and the Artemis
+    <code>door/events</code> API returned identical <code>(employee_no, timestamp)</code> sets —
+    1457 events over 3 days, zero one-sided. The <code>doorIndexCode</code> column is kept only for
+    that cross-check.</p>
+  </div>
+</section>
+
+<!-- ================= 2. WHY SERIALS ================= -->
+<section>
+  <div class="sec-head">
+    <div class="eyebrow">the premise</div>
+    <h2>A counter can prove completeness; a clock cannot</h2>
+  </div>
+  <div class="grid-2">
+    <div class="panel">
+      <h3>Artemis window path</h3>
+      <p class="tight">Asks <em>“what happened between 08:00 and 08:30?”</em>. If a terminal uploaded
+      late, the window that would have carried the event has already closed. <strong>A missing event
+      and a quiet half-hour look identical</strong> — the loss is invisible, and nothing records that
+      it happened.</p>
+    </div>
+    <div class="panel">
+      <h3>Device path</h3>
+      <p class="tight">Asks <em>“give me serial 134500 through 134511”</em>. The device answers with a
+      count, and the count is checkable against the width of the span.
+      <strong>A hole becomes a number instead of an inference</strong> — and a poller that was down
+      just asks for a wider span.</p>
+    </div>
+  </div>
+  <p style="margin-top:16px">The query must be <strong>unfiltered</strong> (<code>major:0, minor:0</code>)
+  because the completeness check needs the dense counter — every event type shares it. Asking the
+  device for authentications only would return 14 of a 41-wide span every time, making the comparison
+  meaningless. So <code>major 5 / minor 75</code> is filtered <em>in-process</em>, after the check.</p>
+</section>
+
+<!-- ================= 3. THE RIBBON ================= -->
+<section>
+  <div class="sec-head">
+    <div class="eyebrow">one real span</div>
+    <h2>The serial tape, slot by slot</h2>
+  </div>
+  <p>One cycle on <code>10.1.72.119</code>. The cursor sat at <code>134499</code>;
+  <code>newest_serial()</code> reported <code>134510</code>. So the fetch is
+  <code>fetch_range(134500, 134510)</code> — eleven numbered slots, every event type included.</p>
+
+  <figure class="panel">
+    <div class="ribbon-wrap">
+      <div class="scroll">
+        <div class="ribbon">
+          <div class="slot cursor">
+            <span class="sn">134499</span><span class="tm">15:04:12</span>
+            <span class="kind">cursor</span><span class="who">already sent</span>
+          </div>
+          <div class="slot auth">
+            <span class="sn">134500</span><span class="tm">15:06:41</span>
+            <span class="kind">auth ok</span><span class="who">FWBW0328767</span>
+          </div>
+          <div class="slot door">
+            <span class="sn">134501</span><span class="tm">15:06:42</span>
+            <span class="kind">door open</span><span class="who">—</span>
+          </div>
+          <div class="slot door">
+            <span class="sn">134502</span><span class="tm">15:06:47</span>
+            <span class="kind">door close</span><span class="who">—</span>
+          </div>
+          <div class="slot auth">
+            <span class="sn">134503</span><span class="tm">15:07:03</span>
+            <span class="kind">auth ok</span><span class="who">FWBW0331902</span>
+          </div>
+          <div class="slot door">
+            <span class="sn">134504</span><span class="tm">15:07:04</span>
+            <span class="kind">door open</span><span class="who">—</span>
+          </div>
+          <div class="slot door">
+            <span class="sn">134505</span><span class="tm">15:07:09</span>
+            <span class="kind">door close</span><span class="who">—</span>
+          </div>
+          <div class="slot auth">
+            <span class="sn">134506</span><span class="tm">15:07:20</span>
+            <span class="kind">auth ok</span><span class="who">RC13501</span>
+          </div>
+          <div class="slot door">
+            <span class="sn">134507</span><span class="tm">15:07:21</span>
+            <span class="kind">door open</span><span class="who">—</span>
+          </div>
+          <div class="slot door">
+            <span class="sn">134508</span><span class="tm">15:07:26</span>
+            <span class="kind">door close</span><span class="who">—</span>
+          </div>
+          <div class="slot sys">
+            <span class="sn">134509</span><span class="tm">15:07:30</span>
+            <span class="kind">system</span><span class="who">—</span>
+          </div>
+          <div class="slot dup">
+            <span class="sn">134510</span><span class="tm">15:07:35</span>
+            <span class="kind">auth dup</span><span class="who">FWBW0328767</span>
+          </div>
+        </div>
+      </div>
+      <div class="legend">
+        <span><i class="swatch" style="background:var(--accent)"></i>cursor (last serial fully processed)</span>
+        <span><i class="swatch" style="background:var(--in)"></i>major 5 / minor 75 — auth, carries employeeNoString</span>
+        <span><i class="swatch" style="background:var(--rule)"></i>door open / close — counted, then dropped</span>
+        <span><i class="swatch" style="background:var(--warn)"></i>auth suppressed by the dedup memory</span>
+      </div>
+    </div>
+    <div class="arith">
+      <div class="row">
+        <span class="lbl">width</span>
+        <span><code>end − begin + 1</code> = 134510 − 134500 + 1 = <strong>11</strong></span>
+        <span class="verdict">slots asked for</span>
+      </div>
+      <div class="row">
+        <span class="lbl">totalMatches</span>
+        <span>device reported <strong>11</strong> — equals width, so its log has no holes</span>
+        <span class="verdict">dense</span>
+      </div>
+      <div class="row">
+        <span class="lbl">len(events)</span>
+        <span><strong>11</strong> retrieved across 1 page of 30 — paging lost nothing</span>
+        <span class="verdict">complete</span>
+      </div>
+      <div class="row">
+        <span class="lbl">after auth filter</span>
+        <span><strong>4</strong> authentications; 6 door events and 1 system event drop out here</span>
+        <span class="verdict">carried forward</span>
+      </div>
+    </div>
+    <figcaption>Both equalities are enforced in <code>device_events.fetch_range</code>
+    (<code>device_events.py:146</code> and <code>:150</code>). Failing the first raises
+    <code>DeviceFetchError</code>; failing the second raises <code>DeviceGapError</code>, which
+    carries the survivors so the caller can still salvage them.</figcaption>
+  </figure>
+
+  <h3 style="margin-top:26px">The same span with a hole in it</h3>
+  <figure class="panel">
+    <div class="scroll">
+      <div class="ribbon">
+        <div class="slot auth"><span class="sn">134500</span><span class="tm">15:06:41</span><span class="kind">auth ok</span><span class="who">FWBW0328767</span></div>
+        <div class="slot door"><span class="sn">134501</span><span class="tm">15:06:42</span><span class="kind">door open</span><span class="who">—</span></div>
+        <div class="slot hole"><span class="sn">134502</span><span class="tm">—</span><span class="kind">missing</span><span class="who">—</span></div>
+        <div class="slot hole"><span class="sn">134503</span><span class="tm">—</span><span class="kind">missing</span><span class="who">—</span></div>
+        <div class="slot auth"><span class="sn">134504</span><span class="tm">15:07:04</span><span class="kind">auth ok</span><span class="who">FWBW0331902</span></div>
+        <div class="slot door"><span class="sn">134505</span><span class="tm">15:07:09</span><span class="kind">door close</span><span class="who">—</span></div>
+        <div class="slot sys"><span class="sn">…</span><span class="tm">—</span><span class="kind">etc</span><span class="who">—</span></div>
+      </div>
+    </div>
+    <div class="arith">
+      <div class="row bad">
+        <span class="lbl">width vs totalMatches</span>
+        <span>11 asked for, device holds <strong>9</strong> — 2 events are gone from the device's own log</span>
+        <span class="verdict">DeviceGapError</span>
+      </div>
+      <div class="row bad">
+        <span class="lbl">action</span>
+        <span>write <code>errors/device_gap_&lt;ip&gt;_&lt;ts&gt;.json</code>, Lark alert,
+        <strong>send the survivors and advance the cursor</strong></span>
+        <span class="verdict">does not heal</span>
+      </div>
+    </div>
+    <figcaption>A hole in the device's log is permanent — there is no upstream copy to re-ask.
+    So the serial numbers are written down before the cursor moves past them
+    (<code>main._log_device_gap</code>, <code>main.py:424</code>). Stalling would only stop every
+    later event too.</figcaption>
+  </figure>
+</section>
+
+<!-- ================= 4. THE CYCLE ================= -->
+<section>
+  <div class="sec-head">
+    <div class="eyebrow">run_device_cycle(host) · main.py:437</div>
+    <h2>One poll, gate by gate</h2>
+  </div>
+  <p>Called once per device by <code>run_devices()</code>, which holds the cross-process send lock
+  (<code>state/rymnet_send.lock</code>) around the whole sweep so device and Artemis senders never
+  overlap. Inside the scheduler this runs every <code>DEVICE_POLL_SECONDS</code> while it sleeps
+  toward the next half-hour boundary — the two paths keep independent cadences.</p>
+
+  <div class="ladder">
+
+    <div class="gate">
+      <div>
+        <div class="fn">checkpoint.load_pending(sig)</div>
+        <p class="what">Rymnet retry first. Any batch that failed last cycle is re-sent before new
+        data is fetched. The signature is keyed on the <strong>device alone</strong>, never the serial
+        span — a span-keyed signature would orphan the pending batch the moment the span moved.</p>
+        <div class="branches">
+          <div class="branch ok"><span class="cond">sends</span><span class="res">clear pending, carry on to the fetch</span></div>
+          <div class="branch crit"><span class="cond">stop == True</span><span class="res">return <code>(False, 0)</code> — nothing new is fetched this cycle</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="gate">
+      <div>
+        <div class="fn">device_events.newest_serial(host)</div>
+        <p class="what">A one-row unfiltered search with <code>timeReverseOrder</code> — the upper
+        bound of the fetch, plus the device's own timestamp for it.</p>
+        <div class="branches">
+          <div class="branch crit"><span class="cond">empty log / 5 failed attempts</span><span class="res"><code>DeviceFetchError</code> — logged, other devices continue, retried next poll</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="gate">
+      <div>
+        <div class="fn">cursor is None</div>
+        <p class="what">First ever run for this device. The cursor is planted at the newest serial and
+        the cycle ends — deliberately <strong>no backfill</strong>, so switching a door on cannot dump
+        months of history into Rymnet.</p>
+        <div class="branches">
+          <div class="branch warn"><span class="cond">bootstrap</span><span class="res">save cursor, Lark note, <code>return (True, 0)</code>. To backfill: edit <code>state/devices/&lt;ip&gt;.json</code></span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="gate">
+      <div>
+        <div class="fn">newest &lt; cursor</div>
+        <p class="what">The counter went backwards, which only happens if the device's event log was
+        wiped and restarted at 1. Re-consuming from 1 would re-send everything, so the code refuses.</p>
+        <div class="branches">
+          <div class="branch crit"><span class="cond">log reset</span><span class="res">Lark alert, <strong>cursor left untouched</strong> — this device stops syncing until a human fixes the state file</span></div>
+          <div class="branch idle"><span class="cond">newest == cursor</span><span class="res">nothing new; <code>return (True, 0)</code></span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="gate">
+      <div>
+        <div class="fn">device_events.fetch_range(host, cursor + 1, newest)</div>
+        <p class="what">Unfiltered, inclusive, paged 30 at a time with <strong>one stable
+        <code>searchID</code></strong> and a 0.4 s pace between pages. Both completeness equalities are
+        checked before returning.</p>
+        <div class="branches">
+          <div class="branch ok"><span class="cond">dense</span><span class="res">events returned</span></div>
+          <div class="branch warn"><span class="cond">DeviceGapError</span><span class="res">log the gap file, alert, continue with <code>e.events</code></span></div>
+          <div class="branch crit"><span class="cond">DeviceFetchError</span><span class="res">cycle aborts, cursor untouched, same span refetched next poll</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="gate">
+      <div>
+        <div class="fn">device_events.auth_events(events)</div>
+        <p class="what">Keep <code>major 5 / minor 75</code> with a non-empty
+        <code>employeeNoString</code>, then <strong>sort by <code>(time, serialNo)</code></strong> —
+        response order is not serial order, since an auth and its door-open event share a second and
+        can arrive either way round.</p>
+      </div>
+    </div>
+
+    <div class="gate">
+      <div>
+        <div class="fn">_prepare_page(auth, {}, set(), last_sent, resolve=…)</div>
+        <p class="what">The shared pipeline stage — identical to the Artemis path except for the
+        injected resolver. Returns <code>(audited, deduped, dupes)</code>: everything for the audit
+        trail, and the subset actually worth sending.</p>
+        <div class="branches">
+          <div class="branch ok"><span class="cond">audited</span><span class="res">every record, each tagged <code>duplicate: true|false</code></span></div>
+          <div class="branch ok"><span class="cond">deduped</span><span class="res">non-duplicates, minus <code>ExcludeList</code>, minus anything outside the FW roster when <code>FOREIGN_WORKER=true</code></span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="gate">
+      <div>
+        <div class="fn">db.insert_records(audited) → _send_resilient(batch, …)</div>
+        <p class="what">Audit rows first (duplicates included), then batches of ≤ 100 to Rymnet
+        through the 10-calls-per-60s throttle. A failed batch is retried 3× at 2 s, then broken up and
+        re-sent one record at a time so one poison record cannot block the rest.</p>
+        <div class="branches">
+          <div class="branch ok"><span class="cond">batch accepted</span><span class="res">status <code>SUCCESS</code></span></div>
+          <div class="branch warn"><span class="cond">some records rejected alone</span><span class="res">good ones delivered; bad ones written to <code>errors/</code>, marked <code>FAILED</code>, dropped</span></div>
+          <div class="branch crit"><span class="cond">nothing sends alone</span><span class="res">batch saved as pending, marked <code>PENDING</code>, <code>return (False, total)</code></span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="gate">
+      <div>
+        <div class="fn">device_events.save_state(host, newest, last_sent)</div>
+        <p class="what">The cursor advances <strong>only here</strong> — after everything fetched has
+        been sent. Written atomically via a <code>.tmp</code> + <code>os.replace</code>, together with
+        the aged dedup memory.</p>
+        <div class="branches">
+          <div class="branch ok"><span class="cond">reached</span><span class="res">cursor = newest; window state cleared</span></div>
+          <div class="branch crit"><span class="cond">not reached</span><span class="res">cursor stays put — the identical span is refetched next poll. No window to miss.</span></div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<!-- ================= 5. CURSOR TAPE ================= -->
+<section>
+  <div class="sec-head">
+    <div class="eyebrow">across cycles</div>
+    <h2>Why a failed send costs nothing</h2>
+  </div>
+  <figure class="panel">
+    <div class="svg-scroll">
+      <svg viewBox="0 0 900 260" role="img" aria-label="Three consecutive poll cycles showing the cursor advancing only after a successful send, and a failed cycle refetching the same serial span.">
+        <defs>
+          <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+          </marker>
+        </defs>
+
+        <!-- serial axis -->
+        <line x1="60" y1="52" x2="860" y2="52" stroke="var(--rule)" stroke-width="1"/>
+        <text x="60" y="34" fill="var(--muted)" font-family="ui-monospace, monospace" font-size="11">serial counter →</text>
+
+        <g font-family="ui-monospace, monospace" font-size="11" fill="var(--muted)" text-anchor="middle">
+          <g stroke="var(--rule)">
+            <line x1="60"  y1="46" x2="60"  y2="58"/>
+            <line x1="260" y1="46" x2="260" y2="58"/>
+            <line x1="460" y1="46" x2="460" y2="58"/>
+            <line x1="660" y1="46" x2="660" y2="58"/>
+            <line x1="860" y1="46" x2="860" y2="58"/>
+          </g>
+          <text x="60"  y="72">134499</text>
+          <text x="260" y="72">134510</text>
+          <text x="460" y="72">134538</text>
+          <text x="660" y="72">134566</text>
+          <text x="860" y="72">134591</text>
+        </g>
+
+        <!-- cycle 1: ok -->
+        <g>
+          <rect x="60" y="96" width="200" height="30" rx="2" fill="var(--ok-soft)" stroke="var(--ok)"/>
+          <text x="70" y="116" font-family="ui-monospace, monospace" font-size="12" fill="var(--ok)">fetch 134500–134510 · sent 3 · cursor → 134510</text>
+          <text x="864" y="116" font-family="ui-monospace, monospace" font-size="11" fill="var(--muted)">cycle 1</text>
+        </g>
+
+        <!-- cycle 2: failed -->
+        <g>
+          <rect x="260" y="140" width="200" height="30" rx="2" fill="var(--crit-soft)" stroke="var(--crit)" stroke-dasharray="4 3"/>
+          <text x="270" y="160" font-family="ui-monospace, monospace" font-size="12" fill="var(--crit)">fetch 134511–134538 · Rymnet down · cursor stays</text>
+          <text x="864" y="160" font-family="ui-monospace, monospace" font-size="11" fill="var(--muted)">cycle 2</text>
+        </g>
+
+        <!-- cycle 3: wider refetch -->
+        <g>
+          <rect x="260" y="184" width="400" height="30" rx="2" fill="var(--ok-soft)" stroke="var(--ok)"/>
+          <text x="270" y="204" font-family="ui-monospace, monospace" font-size="12" fill="var(--ok)">fetch 134511–134566 · wider span, nothing lost · cursor → 134566</text>
+          <text x="864" y="204" font-family="ui-monospace, monospace" font-size="11" fill="var(--muted)">cycle 3</text>
+        </g>
+
+        <!-- cursor markers -->
+        <g color="var(--accent)">
+          <line x1="60"  y1="88" x2="60"  y2="130" stroke="var(--accent)" stroke-width="2"/>
+          <line x1="260" y1="88" x2="260" y2="218" stroke="var(--accent)" stroke-width="2"/>
+          <line x1="660" y1="88" x2="660" y2="218" stroke="var(--accent)" stroke-width="2"/>
+        </g>
+        <text x="60" y="238" font-family="ui-monospace, monospace" font-size="11" fill="var(--accent)" text-anchor="middle">cursor</text>
+        <text x="260" y="238" font-family="ui-monospace, monospace" font-size="11" fill="var(--accent)" text-anchor="middle">cursor</text>
+        <text x="660" y="238" font-family="ui-monospace, monospace" font-size="11" fill="var(--accent)" text-anchor="middle">cursor</text>
+      </svg>
+    </div>
+    <figcaption>The cursor is the only thing that decides where a device resumes, and it moves only
+    after a successful send. Downtime therefore self-heals: a poller offline for hours asks for a
+    wider span, and any span is replayable exactly for as long as the device retains it (observed back
+    to 2025-12-17 on <code>10.1.72.122</code>).</figcaption>
+  </figure>
+</section>
+
+<!-- ================= 6. RECORD TRANSFORM ================= -->
+<section>
+  <div class="sec-head">
+    <div class="eyebrow">one event, end to end</div>
+    <h2>Serial 134500 becomes a Rymnet record</h2>
+  </div>
+  <p>Following the <code>FWBW0328767</code> authentication from the ribbon above through every
+  transformation, in order.</p>
+
+  <div class="chain">
+
+    <div class="stage">
+      <div class="hd"><span class="name">raw ISAPI AcsEvent</span><span class="note">POST /ISAPI/AccessControl/AcsEvent?format=json</span></div>
+<pre><span class="c">// one entry of AcsEvent.InfoList</span>
+{ <span class="k">"serialNo"</span>: <span class="n">134500</span>,
+  <span class="k">"time"</span>: <span class="s">"2026-08-12T15:06:41+08:00"</span>,
+  <span class="k">"major"</span>: <span class="n">5</span>, <span class="k">"minor"</span>: <span class="n">75</span>,        <span class="c">// successful authentication</span>
+  <span class="k">"employeeNoString"</span>: <span class="s">"FWBW0328767"</span>,
+  <span class="k">"name"</span>: <span class="s">"IBRAHIM MD"</span> }</pre>
+    </div>
+
+    <div class="link"></div>
+
+    <div class="stage">
+      <div class="hd"><span class="name">_resolve_device_record(item, info)</span><span class="note">main.py:186 — no person lookup at all</span></div>
+      <p class="what" style="font-size:14px">The device's <code>employeeNoString</code>
+      <strong>is</strong> the Artemis <code>personCode</code> (verified against the personId API), so
+      the whole <code>personId → personCode</code> round trip disappears. Location and indicator come
+      straight from the <code>DeviceList</code> entry instead of a door lookup, and the timestamp is
+      reformatted by <code>reformat_time</code>.</p>
+<pre>build_body(
+  employee_no = <span class="s">"FWBW0328767"</span>,   <span class="c">// item["employeeNoString"]</span>
+  logtime     = <span class="s">"2026-08-12 15:06:41"</span>,  <span class="c">// fromisoformat → '%Y-%m-%d %H:%M:%S'</span>
+  location    = <span class="s">"WHCJ OUT - FR"</span>,  <span class="c">// DeviceList[host]["doorName"]</span>
+  indicator   = <span class="s">"OUT"</span>,           <span class="c">// DeviceList[host]["indicator"]</span>
+)</pre>
+    </div>
+
+    <div class="link"></div>
+
+    <div class="stage">
+      <div class="hd"><span class="name">FW prefix normalize</span><span class="note">_prepare_page, main.py:225</span></div>
+<pre>employee_no <span class="s">"FWBW0328767"</span> → <span class="s">"FW-BW0328767"</span>   <span class="c">// 'FW' + '-' + rest</span></pre>
+    </div>
+
+    <div class="link"></div>
+
+    <div class="stage">
+      <div class="hd"><span class="name">duplicate check</span><span class="note">keyed on person + physical device, not door</span></div>
+      <p class="what" style="font-size:14px"><code>_device_id</code> strips the direction word out of
+      the door name, so the same turnstile registering a bounce on either reader collapses to one
+      device. A second event for the same key inside <code>MIN_GAP_MINUTES</code> is tagged
+      <code>duplicate</code> — audited, never sent.</p>
+<pre><span class="c">// _device_id("WHCJ OUT - FR", "OUT") → "WHCJ - FR"</span>
+key = (<span class="s">"FW-BW0328767"</span>, <span class="s">"WHCJ - FR"</span>)
+
+134500  15:06:41   key unseen               → send, remember
+134510  15:07:35   54 s &lt; MIN_GAP (60 s)    → <span class="n">duplicate: true</span></pre>
+    </div>
+
+    <div class="link"></div>
+
+    <div class="stage">
+      <div class="hd"><span class="name">filters applied to the send list only</span><span class="note">audit keeps everything</span></div>
+      <div class="grid-2">
+        <div>
+          <dl class="kv">
+            <dt>ExcludeList</dt><dd>always dropped from send</dd>
+            <dt>FOREIGN_WORKER</dt><dd>if true, keep only Rymnet <code>category_code=FW</code></dd>
+            <dt>ONLY_EMPLOYEE_NO</dt><dd><code>--employee-no</code> restriction</dd>
+            <dt>EVENT_TEST</dt><dd>Lark ping when this employee_no is seen</dd>
+          </dl>
+        </div>
+        <div>
+          <dl class="kv">
+            <dt>audited</dt><dd>4 records → <code>hik_records</code></dd>
+            <dt>deduped</dt><dd>3 records → Rymnet</dd>
+            <dt>status rows</dt><dd>3 (duplicates get none)</dd>
+            <dt>jsonl sink</dt><dd><code>logs/attendance_&lt;date&gt;.jsonl</code></dd>
+          </dl>
+        </div>
+      </div>
+    </div>
+
+    <div class="link"></div>
+
+    <div class="stage">
+      <div class="hd"><span class="name">db.insert_records(audited)</span><span class="note">best-effort — DB errors are logged, never raised</span></div>
+      <p class="what" style="font-size:14px">One fresh row per record ever seen, duplicates included,
+      never an upsert. Returns UUIDs aligned with the input; the non-duplicate slice of those ids is
+      what <code>_send_resilient</code> mirrors send outcomes onto.</p>
+<pre>hik_records        4 rows   employee_no · logtime · location · indicator · created_by='system'
+hik_record_status  3 rows   SUCCESS | PENDING | FAILED   (FK → hik_records.id, cascade)</pre>
+    </div>
+
+    <div class="link"></div>
+
+    <div class="stage">
+      <div class="hd"><span class="name">POST to Rymnet</span><span class="note">signature/final_data.send — bearer token, 10 calls / 60 s sliding window</span></div>
+<pre>[ { <span class="k">"employee_no"</span>: <span class="s">"FW-BW0328767"</span>, <span class="k">"logtime"</span>: <span class="s">"2026-08-12 15:06:41"</span>,
+    <span class="k">"indicator"</span>: <span class="s">"OUT"</span>, <span class="k">"location"</span>: <span class="s">"WHCJ OUT - FR"</span>, <span class="k">"remarks"</span>: <span class="s">""</span> }, … ]</pre>
+    </div>
+
+  </div>
+</section>
+
+<!-- ================= 7. STATE ================= -->
+<section>
+  <div class="sec-head">
+    <div class="eyebrow">state/devices/&lt;ip&gt;.json</div>
+    <h2>The two things a device remembers</h2>
+  </div>
+  <div class="panel">
+<pre>{ <span class="k">"device"</span>: <span class="s">"10.1.72.119"</span>,
+  <span class="k">"cursor"</span>: <span class="n">134510</span>,
+  <span class="k">"updated"</span>: <span class="s">"2026-08-12 15:08:02"</span>,
+  <span class="k">"last_sent"</span>: { <span class="k">"FW-BW0328767|WHCJ - FR"</span>: <span class="s">"2026-08-12 15:06:41"</span>,
+                  <span class="k">"RC13501|WHCJ - FR"</span>:     <span class="s">"2026-08-12 15:07:20"</span> } }</pre>
+  </div>
+  <div class="grid-2" style="margin-top:14px">
+    <div class="panel">
+      <h3>cursor</h3>
+      <p class="tight">Highest serial fully processed. The single source of truth for where a device
+      resumes — which is also why a backfill is a state edit, not a flag.</p>
+    </div>
+    <div class="panel">
+      <h3>last_sent</h3>
+      <p class="tight">Dedup memory carried <strong>across</strong> cycles. Device polls are short and
+      frequent, so without persisting it two events seconds apart either side of a cycle boundary
+      would both pass the gap check. Aged against the newest event seen, not the wall clock, so a
+      backfill of old serials still dedups correctly within itself.</p>
+    </div>
+  </div>
+  <p style="margin-top:16px">Note the state directory is currently <strong>empty</strong> — neither
+  device has a cursor yet. The next device run bootstraps each one at its newest serial and sends
+  nothing.</p>
+</section>
+
+<!-- ================= 8. FAILURE MATRIX ================= -->
+<section>
+  <div class="sec-head">
+    <div class="eyebrow">behaviour on trouble</div>
+    <h2>What each failure costs</h2>
+  </div>
+  <div class="panel scroll">
+    <table>
+      <thead>
+        <tr><th>condition</th><th>detected by</th><th>action</th><th>cursor</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Device log has holes</td>
+          <td class="m">totalMatches != width</td>
+          <td>gap file in <code>errors/</code>, Lark alert, <strong>survivors sent</strong></td>
+          <td><span class="tag t-warn">advances</span></td>
+        </tr>
+        <tr>
+          <td>Paging lost rows</td>
+          <td class="m">len(events) != totalMatches</td>
+          <td><code>DeviceFetchError</code>, cycle aborts</td>
+          <td><span class="tag t-ok">held</span></td>
+        </tr>
+        <tr>
+          <td>Device log wiped, counter restarts</td>
+          <td class="m">newest &lt; cursor</td>
+          <td>Lark alert; needs a manual state fix before this device syncs again</td>
+          <td><span class="tag t-crit">frozen</span></td>
+        </tr>
+        <tr>
+          <td>Device unreachable / 401 storm</td>
+          <td class="m">5 attempts failed</td>
+          <td>logged, other devices continue, retried next poll</td>
+          <td><span class="tag t-ok">held</span></td>
+        </tr>
+        <tr>
+          <td>Rymnet rejects a whole batch</td>
+          <td class="m">_send_resilient</td>
+          <td>pending saved against the device signature, retried first next cycle</td>
+          <td><span class="tag t-ok">held</span></td>
+        </tr>
+        <tr>
+          <td>Rymnet rejects one poison record</td>
+          <td class="m">per-record isolation</td>
+          <td>good delivered; bad logged to <code>errors/</code>, marked <code>FAILED</code>, dropped</td>
+          <td><span class="tag t-warn">advances</span></td>
+        </tr>
+        <tr>
+          <td>First ever run</td>
+          <td class="m">cursor is None</td>
+          <td>cursor planted at newest, <strong>no backfill</strong>, Lark note</td>
+          <td><span class="tag t-warn">planted</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="callout">
+    <span class="lbl">the one real backstop</span>
+    <p>Device retention is the only copy. A device offline long enough for its event log to wrap loses
+    that data outright — there is nothing upstream to re-ask. Depth is generous (~8 months observed),
+    so cursor lag is the practical thing to watch.</p>
+  </div>
+</section>
+
+<!-- ================= 9. QUIRKS ================= -->
+<section>
+  <div class="sec-head">
+    <div class="eyebrow">hard-won</div>
+    <h2>Device quirks the code is shaped around</h2>
+  </div>
+  <div class="panel scroll">
+    <table>
+      <thead><tr><th>quirk</th><th>consequence in code</th></tr></thead>
+      <tbody>
+        <tr><td class="m">maxResults caps at 30</td><td>longer spans must be paged — <code>PAGE_SIZE = 30</code></td></tr>
+        <tr><td class="m">one searchID per result set</td><td>a fresh ID per page makes the device answer from a different cached search — observed silently truncating 1148 events to 41, with a matching, wrong <code>totalMatches</code></td></tr>
+        <tr><td class="m">digest nonce goes stale</td><td>one <code>requests.Session</code> per device; a fresh <code>HTTPDigestAuth</code> per request draws 401s after ~8 rapid calls. On 401 the session is dropped and re-challenged</td></tr>
+        <tr><td class="m">empty HTTP 200 bodies</td><td>5 attempts with <code>1.5 × (attempt + 1)</code> backoff, plus a 0.4 s pace between pages</td></tr>
+        <tr><td class="m">beginSerialNo needs endSerialNo</td><td>alone it is <code>400 badJsonContent</code>. Serial-range queries need no time bounds at all</td></tr>
+        <tr><td class="m">alertStream is not a data source</td><td>it only pushes live events, has no history to re-ask, and replays an offline backlog with whatever clock the device had then — a capture showed serials 1…29 stamped <code>2026-01-01</code>. <code>devices.py</code> is kept only as a reference listener</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ================= 10. OPERATE ================= -->
+<section>
+  <div class="sec-head">
+    <div class="eyebrow">operating it</div>
+    <h2>Running and steering the device path</h2>
+  </div>
+  <div class="panel">
+<pre><span class="c"># one cycle per device, then exit — safe at any time, any frequency</span>
+uv run main.py --devices-once
+uv run main.py --devices-once --dry-run   <span class="c"># fetch + resolve only: no send, no DB, no cursor advance</span>
+
+<span class="c"># backfill a device from an older serial (the cursor is the only lever)</span>
+sudo systemctl stop hik-sync
+<span class="c"># edit state/devices/10.1.72.119.json → "cursor": &lt;serial before the first one you want&gt;</span>
+uv run main.py --devices-once --dry-run   <span class="c"># confirm the span + record count first</span>
+uv run main.py --devices-once
+sudo systemctl start hik-sync
+
+<span class="c"># after a gap or reset alert</span>
+cat errors/device_gap_*.json</pre>
+  </div>
+  <div class="callout">
+    <span class="lbl">two documentation drifts worth fixing</span>
+    <p><code>MIN_GAP_MINUTES</code> is <strong>1</strong> in <code>main.py:46</code>, but the README
+    says 5 in two places. And the README documents <code>ex_view.py</code> and
+    <code>ex_device.py</code> — the read-only device viewers referenced by the backfill and
+    gap-recovery flows — but neither file exists in the repo or in git.</p>
+  </div>
+  <p style="margin-top:16px">Rymnet-side dedupe is the only guard against double-counting, so pick a
+  backfill serial deliberately. And stop the service before manual sends: the cross-process lock will
+  make them wait anyway, but stopping avoids contention on a long run.</p>
+</section>
+
+<footer>
+  <span>main.py:437 run_device_cycle</span>
+  <span>main.py:186 _resolve_device_record</span>
+  <span>main.py:214 _prepare_page</span>
+  <span>main.py:112 _send_resilient</span>
+  <span>device_events.py:122 fetch_range</span>
+  <span>DeviceList.py</span>
+</footer>
+
+</div>
+</body>
+</html>

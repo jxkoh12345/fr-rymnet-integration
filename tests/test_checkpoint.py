@@ -9,6 +9,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 
 import checkpoint
 import db
@@ -497,6 +498,51 @@ class DbStatusTests(StateTestBase):
         by_status = {s: ids for ids, s in self.status_calls}
         self.assertEqual(len(by_status[db.STATUS_FAILED]), 2)
         self.assertEqual(len(by_status[db.STATUS_SUCCESS]), 98)
+
+
+class CatchupTests(StateTestBase):
+    """The nightly catch-up: range covers CATCHUP_DAYS back to now, both paths,
+    and windows that close while it runs are queued instead of skipped."""
+
+    def test_missed_windows_are_queued(self):
+        after = datetime.now() - timedelta(minutes=main.WINDOW_MINUTES * 3 + 5)
+        main._queue_missed_windows(after)
+
+        queued = checkpoint.load_failed()
+        self.assertEqual(len(queued), 3)
+        self.assertEqual(queued[0]['start'], main._fmt(after))
+        step = timedelta(minutes=main.WINDOW_MINUTES)
+        self.assertEqual(queued[1]['start'], main._fmt(after + step))
+        self.assertEqual(queued[0]['end'], queued[1]['start'])
+
+    def test_no_missed_window_queues_nothing(self):
+        main._queue_missed_windows(datetime.now())
+        self.assertEqual(checkpoint.load_failed(), [])
+
+    def test_catchup_covers_days_back_to_now_on_both_paths(self):
+        main.iter_pages = FakeIterPages(total_pages=1, page_size=1)
+        main.send = FakeSend()
+        seen = {}
+        orig_range, orig_count = main.run_devices_range, main.db.count_records
+        def record(key, value, result):
+            seen[key] = value
+            return result
+        main.run_devices_range = lambda start, end: record('device', (start, end), 0)
+        main.db.count_records = lambda s, e: record('count', (s, e), 7)
+        orig_window = main.run_window
+        main.run_window = lambda s, e: record('window', (s, e), (True, 0))
+        try:
+            main.run_catchup()
+        finally:
+            main.run_devices_range, main.db.count_records = orig_range, orig_count
+            main.run_window = orig_window
+
+        w_start, w_end = seen['window']
+        expected = datetime.now() - timedelta(days=main.CATCHUP_DAYS)
+        self.assertTrue(w_start.startswith(expected.strftime('%Y-%m-%dT00:00:00')))
+        self.assertGreater(w_end, w_start)
+        self.assertEqual(seen['device'], (w_start, w_end))   # same range, both paths
+        self.assertEqual(seen['count'][0][:10], expected.strftime('%Y-%m-%d'))
 
 
 if __name__ == '__main__':
