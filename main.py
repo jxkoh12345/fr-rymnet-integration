@@ -392,11 +392,11 @@ def _run_window(start: str, end: str, reset: bool = False) -> tuple[bool, int]:
         checkpoint.clear_window(signature)  # completed — no longer needs to rerun
     elapsed = time.perf_counter() - cycle_start
     logger.info(f"=== Window done{' [DRY RUN]' if DRY_RUN else ''} — {total} records sent, {dupes} duplicates skipped in {elapsed:.2f}s ===")
-    if not DRY_RUN:
-        notify(
-            f"[HIK SYNC] Window done: {start} → {end}\n"
-            f"{total} records sent, {dupes} duplicates skipped, {elapsed:.2f}s"
-        )
+    # if not DRY_RUN:
+    #     notify(
+    #         f"[HIK SYNC] Window done: {start} → {end}\n"
+    #         f"{total} records sent, {dupes} duplicates skipped, {elapsed:.2f}s"
+    #     )
     return True, total
 
 
@@ -569,12 +569,12 @@ def run_device_cycle(host: str) -> tuple[bool, int]:
     logger.info(f"{label}: cycle done — {total} records sent, {dupes} duplicates skipped, cursor at {newest}")
     # Only when something was actually sent: the scheduler polls every
     # DEVICE_POLL_SECONDS, so notifying idle cycles would be pure noise.
-    if not DRY_RUN and total:
-        notify(
-            f"[HIK SYNC] Device cycle done{_trigger()}: {label}\n"
-            f"serial {begin} → {newest}\n"
-            f"{total} records sent, {dupes} duplicates skipped"
-        )
+    # if not DRY_RUN and total:
+    #     notify(
+    #         f"[HIK SYNC] Device cycle done{_trigger()}: {label}\n"
+    #         f"serial {begin} → {newest}\n"
+    #         f"{total} records sent, {dupes} duplicates skipped"
+    #     )
     return True, total
 
 
@@ -649,12 +649,12 @@ def run_device_range(host: str, start: str, end: str) -> tuple[bool, int]:
 
     _step(label, '6/6', "range complete — cursor untouched")
     logger.info(f"{label}: range done — {total} records sent, {dupes} duplicates skipped")
-    if not DRY_RUN:
-        notify(
-            f"[HIK SYNC] Device range done{_trigger()}: {label}\n"
-            f"{start} → {end}\n"
-            f"{total} records sent, {dupes} duplicates skipped (cursor untouched)"
-        )
+    # if not DRY_RUN:
+    #     notify(
+    #         f"[HIK SYNC] Device range done{_trigger()}: {label}\n"
+    #         f"{start} → {end}\n"
+    #         f"{total} records sent, {dupes} duplicates skipped (cursor untouched)"
+    #     )
     return True, total
 
 
